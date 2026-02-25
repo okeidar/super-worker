@@ -3,6 +3,8 @@
 Remove individual patches as upstream fixes land.
 """
 
+import inspect
+
 from textual import events as _events
 from textual._xterm_parser import XTermParser as _XTermParser
 
@@ -15,13 +17,19 @@ from textual._xterm_parser import XTermParser as _XTermParser
 # ---------------------------------------------------------------------------
 _original_seq_to_key = getattr(_XTermParser, "_sequence_to_key_events", None)
 
-if callable(_original_seq_to_key):
+if callable(_original_seq_to_key) and not getattr(_original_seq_to_key, "_sw_patched", False):
+    _accepts_alt = "alt" in inspect.signature(_original_seq_to_key).parameters
 
     def _patched_seq_to_key(self, sequence, alt=False):
-        for ev in _original_seq_to_key(self, sequence, alt=alt):
+        if _accepts_alt:
+            events_iter = _original_seq_to_key(self, sequence, alt=alt)
+        else:
+            events_iter = _original_seq_to_key(self, sequence)
+        for ev in events_iter:
             if alt and "alt+" not in ev.key:
                 yield _events.Key(f"alt+{ev.key}", ev.character)
             else:
                 yield ev
 
+    _patched_seq_to_key._sw_patched = True
     _XTermParser._sequence_to_key_events = _patched_seq_to_key
