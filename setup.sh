@@ -56,29 +56,38 @@ if ! command -v claude &>/dev/null; then
 fi
 
 # ── pipx ───────────────────────────────────────────────────────────────
-if ! command -v pipx &>/dev/null; then
+PIPX_CMD=""
+if command -v pipx &>/dev/null; then
+    PIPX_CMD="pipx"
+    info "pipx"
+else
     warn "pipx not found — installing..."
     if command -v brew &>/dev/null; then
         brew install pipx
+        PIPX_CMD="pipx"
     else
         python3 -m pip install --user pipx
+        # pipx may not be on PATH yet in this shell — find it directly
+        PIPX_CMD="$(python3 -m site --user-base)/bin/pipx"
+        if [ ! -f "$PIPX_CMD" ]; then
+            PIPX_CMD="$HOME/.local/bin/pipx"
+        fi
     fi
-    pipx ensurepath 2>/dev/null || true
+    "$PIPX_CMD" ensurepath 2>/dev/null || true
     info "pipx installed"
-else
-    info "pipx"
 fi
 
 # ── Install super-worker ───────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 echo
 echo "Installing super-worker globally via pipx..."
-if pipx list 2>/dev/null | grep -q "super-worker"; then
-    pipx install -e "$SCRIPT_DIR" --force 2>&1 | tail -1
+if "$PIPX_CMD" list 2>/dev/null | grep -q "super-worker"; then
+    "$PIPX_CMD" install -e "$SCRIPT_DIR" --force 2>&1 | tail -1
 else
-    pipx install -e "$SCRIPT_DIR" 2>&1 | tail -1
+    "$PIPX_CMD" install -e "$SCRIPT_DIR" 2>&1 | tail -1
 fi
 info "super-worker installed (available globally as 'sw')"
 
 echo
 echo "Done! Run 'sw' from any terminal to start."
+echo "  (If 'sw' is not found, restart your shell or run: source ~/.zshrc)"
