@@ -26,6 +26,9 @@ def _states(wt: Worktree, state: SessionState = SessionState.RUNNING) -> dict[st
     return {s.tmux_session_name: state for s in wt.sessions}
 
 
+_GIT = {"ahead": 0, "behind": 0}
+
+
 @pytest.mark.asyncio
 async def test_show_worktree_populates_list():
     """show_worktree with 2 sessions produces 2 items in the ListView."""
@@ -33,103 +36,84 @@ async def test_show_worktree_populates_list():
     app = SidebarTestApp()
     async with app.run_test() as pilot:
         sidebar = app.query_one(SessionSidebar)
-        sidebar.show_worktree(wt, states=_states(wt), git_status={"ahead": 0, "behind": 0}, git_dirty=False)
+        sidebar.show_worktree(wt, states=_states(wt), git_status=_GIT, git_dirty=False)
         await pilot.pause()
 
-        items = sidebar.query_one("#session-list", ListView).children
-        assert len(items) == 2
+        assert len(sidebar.query_one("#session-list", ListView).children) == 2
 
 
 @pytest.mark.asyncio
 async def test_show_worktree_updates_in_place():
-    """Calling show_worktree twice with the same sessions but different states updates labels without adding items."""
+    """Calling show_worktree twice with different states updates labels without adding items."""
     wt = _make_worktree(["alpha", "beta"])
     app = SidebarTestApp()
     async with app.run_test() as pilot:
         sidebar = app.query_one(SessionSidebar)
 
-        sidebar.show_worktree(wt, states=_states(wt, SessionState.RUNNING), git_status={"ahead": 0, "behind": 0}, git_dirty=False)
+        sidebar.show_worktree(wt, states=_states(wt, SessionState.RUNNING), git_status=_GIT, git_dirty=False)
         await pilot.pause()
 
-        sidebar.show_worktree(wt, states=_states(wt, SessionState.WAITING_INPUT), git_status={"ahead": 0, "behind": 0}, git_dirty=False)
+        sidebar.show_worktree(wt, states=_states(wt, SessionState.WAITING_INPUT), git_status=_GIT, git_dirty=False)
         await pilot.pause()
 
-        items = sidebar.query_one("#session-list", ListView).children
-        assert len(items) == 2
+        assert len(sidebar.query_one("#session-list", ListView).children) == 2
 
 
 @pytest.mark.asyncio
-async def test_show_worktree_removes_excess_items():
-    """After showing 3 sessions then 1 session, only 1 item remains."""
-    wt3 = _make_worktree(["a", "b", "c"])
-    wt1 = _make_worktree(["a"])
+async def test_show_worktree_grows_and_shrinks():
+    """List correctly adds items then removes excess items."""
     app = SidebarTestApp()
     async with app.run_test() as pilot:
         sidebar = app.query_one(SessionSidebar)
+        sess_list = sidebar.query_one("#session-list", ListView)
 
-        sidebar.show_worktree(wt3, states=_states(wt3), git_status={"ahead": 0, "behind": 0}, git_dirty=False)
+        # Start with 1, grow to 3
+        wt1 = _make_worktree(["a"])
+        sidebar.show_worktree(wt1, states=_states(wt1), git_status=_GIT, git_dirty=False)
         await pilot.pause()
+        assert len(sess_list.children) == 1
 
-        sidebar.show_worktree(wt1, states=_states(wt1), git_status={"ahead": 0, "behind": 0}, git_dirty=False)
+        wt3 = _make_worktree(["a", "b", "c"])
+        sidebar.show_worktree(wt3, states=_states(wt3), git_status=_GIT, git_dirty=False)
         await pilot.pause()
+        assert len(sess_list.children) == 3
 
-        items = sidebar.query_one("#session-list", ListView).children
-        assert len(items) == 1
-
-
-@pytest.mark.asyncio
-async def test_show_worktree_adds_new_items():
-    """After showing 1 session then 3 sessions, 3 items are present."""
-    wt1 = _make_worktree(["a"])
-    wt3 = _make_worktree(["a", "b", "c"])
-    app = SidebarTestApp()
-    async with app.run_test() as pilot:
-        sidebar = app.query_one(SessionSidebar)
-
-        sidebar.show_worktree(wt1, states=_states(wt1), git_status={"ahead": 0, "behind": 0}, git_dirty=False)
+        # Shrink back to 1
+        sidebar.show_worktree(wt1, states=_states(wt1), git_status=_GIT, git_dirty=False)
         await pilot.pause()
-
-        sidebar.show_worktree(wt3, states=_states(wt3), git_status={"ahead": 0, "behind": 0}, git_dirty=False)
-        await pilot.pause()
-
-        items = sidebar.query_one("#session-list", ListView).children
-        assert len(items) == 3
+        assert len(sess_list.children) == 1
 
 
 @pytest.mark.asyncio
 async def test_show_worktree_skips_rebuild_when_unchanged():
-    """Calling show_worktree twice with identical data skips the list rebuild on the second call."""
+    """Calling show_worktree twice with identical data skips the list rebuild."""
     wt = _make_worktree(["alpha", "beta"])
     states = _states(wt)
     app = SidebarTestApp()
     async with app.run_test() as pilot:
         sidebar = app.query_one(SessionSidebar)
 
-        sidebar.show_worktree(wt, states=states, git_status={"ahead": 0, "behind": 0}, git_dirty=False)
+        sidebar.show_worktree(wt, states=states, git_status=_GIT, git_dirty=False)
         await pilot.pause()
 
-        snapshot_after_first = sidebar._prev_session_snapshot
-
-        # Capture item references before second call
         list_view = sidebar.query_one("#session-list", ListView)
         items_before = list(list_view.children)
 
-        sidebar.show_worktree(wt, states=states, git_status={"ahead": 0, "behind": 0}, git_dirty=False)
+        sidebar.show_worktree(wt, states=states, git_status=_GIT, git_dirty=False)
         await pilot.pause()
 
-        # Snapshot must not change and item references must be identical (no rebuild)
-        assert sidebar._prev_session_snapshot == snapshot_after_first
+        # Item references must be identical (no rebuild)
         assert list(list_view.children) == items_before
 
 
 @pytest.mark.asyncio
-async def test_session_map_tracks_indices():
+async def test_session_map_tracks_sessions():
     """_session_map maps each index to the corresponding Session object."""
     wt = _make_worktree(["alpha", "beta", "gamma"])
     app = SidebarTestApp()
     async with app.run_test() as pilot:
         sidebar = app.query_one(SessionSidebar)
-        sidebar.show_worktree(wt, states=_states(wt), git_status={"ahead": 0, "behind": 0}, git_dirty=False)
+        sidebar.show_worktree(wt, states=_states(wt), git_status=_GIT, git_dirty=False)
         await pilot.pause()
 
         assert len(sidebar._session_map) == 3

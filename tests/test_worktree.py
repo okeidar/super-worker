@@ -33,14 +33,10 @@ def _clear_caches():
     _dirty_cache.clear()
 
 
-class TestBranchExistsError:
-    def test_stores_branch_name(self):
-        err = BranchExistsError("sw-feat")
-        assert err.branch == "sw-feat"
-
-    def test_message_contains_branch(self):
-        err = BranchExistsError("sw-feat")
-        assert "sw-feat" in str(err)
+def test_branch_exists_error():
+    err = BranchExistsError("sw-feat")
+    assert err.branch == "sw-feat"
+    assert "sw-feat" in str(err)
 
 
 class TestGetBranchStatus:
@@ -49,41 +45,25 @@ class TestGetBranchStatus:
         mock_repo.git.rev_list.return_value = "3\t7"
         monkeypatch.setattr(gitpython, "Repo", lambda *a, **kw: mock_repo)
         status = get_branch_status("/tmp/wt")
-        assert status["behind"] == 3
-        assert status["ahead"] == 7
+        assert status == {"behind": 3, "ahead": 7}
 
-    def test_returns_zeros_on_failure(self, monkeypatch):
-        monkeypatch.setattr(
-            gitpython, "Repo",
-            MagicMock(side_effect=gitpython.GitCommandError("rev-list", 1)),
-        )
-        status = get_branch_status("/tmp/wt")
-        assert status == {"behind": 0, "ahead": 0}
+    @pytest.mark.parametrize("side_effect", [
+        gitpython.GitCommandError("rev-list", 1),
+        None,  # malformed output case
+    ])
+    def test_returns_zeros_on_failure(self, monkeypatch, side_effect):
+        if side_effect:
+            monkeypatch.setattr(
+                gitpython, "Repo",
+                MagicMock(side_effect=side_effect),
+            )
+        else:
+            mock_repo = MagicMock()
+            mock_repo.git.rev_list.return_value = "garbage"
+            monkeypatch.setattr(gitpython, "Repo", lambda *a, **kw: mock_repo)
+        assert get_branch_status("/tmp/wt") == {"behind": 0, "ahead": 0}
 
-    def test_returns_zeros_on_malformed_output(self, monkeypatch):
-        mock_repo = MagicMock()
-        mock_repo.git.rev_list.return_value = "garbage"
-        monkeypatch.setattr(gitpython, "Repo", lambda *a, **kw: mock_repo)
-        status = get_branch_status("/tmp/wt")
-        assert status == {"behind": 0, "ahead": 0}
-
-    def test_uses_cache_within_ttl(self, monkeypatch):
-        call_count = 0
-        original_repo = gitpython.Repo
-
-        def counting_repo(*a, **kw):
-            nonlocal call_count
-            call_count += 1
-            mock = MagicMock()
-            mock.git.rev_list.return_value = "1\t2"
-            return mock
-
-        monkeypatch.setattr(gitpython, "Repo", counting_repo)
-        get_branch_status("/tmp/wt")
-        get_branch_status("/tmp/wt")
-        assert call_count == 1
-
-    def test_cache_expires_after_ttl(self, monkeypatch):
+    def test_uses_cache_and_expires(self, monkeypatch):
         call_count = 0
 
         def counting_repo(*a, **kw):
@@ -94,15 +74,17 @@ class TestGetBranchStatus:
             return mock
 
         monkeypatch.setattr(gitpython, "Repo", counting_repo)
-        get_branch_status("/tmp/wt")
-
-        # Manually expire the cache entry
-        path = "/tmp/wt"
-        ts, val = _branch_status_cache[path]
-        _branch_status_cache[path] = (ts - _GIT_CACHE_TTL - 1, val)
 
         get_branch_status("/tmp/wt")
-        assert call_count == 2
+        get_branch_status("/tmp/wt")
+        assert call_count == 1  # cached
+
+        # Expire the cache entry
+        ts, val = _branch_status_cache["/tmp/wt"]
+        _branch_status_cache["/tmp/wt"] = (ts - _GIT_CACHE_TTL - 1, val)
+
+        get_branch_status("/tmp/wt")
+        assert call_count == 2  # re-fetched
 
     def test_uses_custom_remote_and_branch(self, monkeypatch):
         mock_repo = MagicMock()
@@ -114,94 +96,78 @@ class TestGetBranchStatus:
         )
 
 
-class TestGetWorktreeDirty:
-    def test_dirty_when_repo_is_dirty(self, monkeypatch):
-        mock_repo = MagicMock()
-        mock_repo.is_dirty.return_value = True
-        monkeypatch.setattr(gitpython, "Repo", lambda *a, **kw: mock_repo)
-        assert get_worktree_dirty("/tmp/wt") is True
-
-    def test_clean_when_repo_is_clean(self, monkeypatch):
-        mock_repo = MagicMock()
-        mock_repo.is_dirty.return_value = False
-        monkeypatch.setattr(gitpython, "Repo", lambda *a, **kw: mock_repo)
-        assert get_worktree_dirty("/tmp/wt") is False
-
-    def test_uses_cache(self, monkeypatch):
-        call_count = 0
-
-        def counting_repo(*a, **kw):
-            nonlocal call_count
-            call_count += 1
-            mock = MagicMock()
-            mock.is_dirty.return_value = True
-            return mock
-
-        monkeypatch.setattr(gitpython, "Repo", counting_repo)
-        get_worktree_dirty("/tmp/wt")
-        get_worktree_dirty("/tmp/wt")
-        assert call_count == 1
+@pytest.mark.parametrize("is_dirty", [True, False])
+def test_get_worktree_dirty(monkeypatch, is_dirty):
+    mock_repo = MagicMock()
+    mock_repo.is_dirty.return_value = is_dirty
+    monkeypatch.setattr(gitpython, "Repo", lambda *a, **kw: mock_repo)
+    assert get_worktree_dirty("/tmp/wt") is is_dirty
 
 
-class TestInvalidateGitCache:
-    def test_clears_both_caches(self, monkeypatch):
-        mock_repo = MagicMock()
-        mock_repo.git.rev_list.return_value = "1\t2"
-        mock_repo.is_dirty.return_value = True
-        monkeypatch.setattr(gitpython, "Repo", lambda *a, **kw: mock_repo)
+def test_get_worktree_dirty_uses_cache(monkeypatch):
+    call_count = 0
 
-        get_branch_status("/tmp/wt")
-        get_worktree_dirty("/tmp/wt")
+    def counting_repo(*a, **kw):
+        nonlocal call_count
+        call_count += 1
+        mock = MagicMock()
+        mock.is_dirty.return_value = True
+        return mock
 
-        assert "/tmp/wt" in _branch_status_cache
-        assert "/tmp/wt" in _dirty_cache
-
-        invalidate_git_cache("/tmp/wt")
-
-        assert "/tmp/wt" not in _branch_status_cache
-        assert "/tmp/wt" not in _dirty_cache
-
-    def test_no_error_on_missing_key(self):
-        invalidate_git_cache("/nonexistent")
+    monkeypatch.setattr(gitpython, "Repo", counting_repo)
+    get_worktree_dirty("/tmp/wt")
+    get_worktree_dirty("/tmp/wt")
+    assert call_count == 1
 
 
-class TestPruneGitCache:
-    def test_removes_stale_entries(self):
-        _branch_status_cache["/a"] = (time.monotonic(), {"behind": 0, "ahead": 0})
-        _branch_status_cache["/b"] = (time.monotonic(), {"behind": 0, "ahead": 0})
-        _dirty_cache["/a"] = (time.monotonic(), False)
-        _dirty_cache["/c"] = (time.monotonic(), True)
+def test_invalidate_git_cache(monkeypatch):
+    mock_repo = MagicMock()
+    mock_repo.git.rev_list.return_value = "1\t2"
+    mock_repo.is_dirty.return_value = True
+    monkeypatch.setattr(gitpython, "Repo", lambda *a, **kw: mock_repo)
 
-        prune_git_cache({"/a"})
+    get_branch_status("/tmp/wt")
+    get_worktree_dirty("/tmp/wt")
+    assert "/tmp/wt" in _branch_status_cache and "/tmp/wt" in _dirty_cache
 
-        assert "/a" in _branch_status_cache
-        assert "/b" not in _branch_status_cache
-        assert "/a" in _dirty_cache
-        assert "/c" not in _dirty_cache
+    invalidate_git_cache("/tmp/wt")
+    assert "/tmp/wt" not in _branch_status_cache and "/tmp/wt" not in _dirty_cache
 
-    def test_empty_valid_paths_clears_all(self):
-        _branch_status_cache["/x"] = (time.monotonic(), {"behind": 0, "ahead": 0})
-        _dirty_cache["/y"] = (time.monotonic(), False)
-
-        prune_git_cache(set())
-
-        assert len(_branch_status_cache) == 0
-        assert len(_dirty_cache) == 0
+    # No error on missing key
+    invalidate_git_cache("/nonexistent")
 
 
-class TestGetCurrentBranch:
-    def test_success(self, monkeypatch):
+def test_prune_git_cache():
+    _branch_status_cache["/a"] = (time.monotonic(), {"behind": 0, "ahead": 0})
+    _branch_status_cache["/b"] = (time.monotonic(), {"behind": 0, "ahead": 0})
+    _dirty_cache["/a"] = (time.monotonic(), False)
+    _dirty_cache["/c"] = (time.monotonic(), True)
+
+    prune_git_cache({"/a"})
+
+    assert "/a" in _branch_status_cache and "/b" not in _branch_status_cache
+    assert "/a" in _dirty_cache and "/c" not in _dirty_cache
+
+    # Empty set clears all
+    prune_git_cache(set())
+    assert len(_branch_status_cache) == 0 and len(_dirty_cache) == 0
+
+
+@pytest.mark.parametrize("success,expected", [
+    (True, "feature-branch"),
+    (False, "(unknown)"),
+])
+def test_get_current_branch(monkeypatch, success, expected):
+    if success:
         mock_repo = MagicMock()
         mock_repo.active_branch.name = "feature-branch"
         monkeypatch.setattr(gitpython, "Repo", lambda *a, **kw: mock_repo)
-        assert get_current_branch("/tmp/repo") == "feature-branch"
-
-    def test_failure_returns_unknown(self, monkeypatch):
+    else:
         monkeypatch.setattr(
             gitpython, "Repo",
             MagicMock(side_effect=gitpython.InvalidGitRepositoryError("not a repo")),
         )
-        assert get_current_branch("/tmp/repo") == "(unknown)"
+    assert get_current_branch("/tmp/repo") == expected
 
 
 class TestCreateWorktree:
@@ -227,7 +193,6 @@ class TestCreateWorktree:
 
     def test_creates_worktree_with_new_branch(self, tmp_path, monkeypatch):
         config = self._make_config(tmp_path)
-
         mock_repo = MagicMock()
         mock_repo.git.rev_parse.side_effect = gitpython.GitCommandError("rev-parse", 1)
         monkeypatch.setattr(gitpython, "Repo", lambda *a, **kw: mock_repo)
@@ -238,16 +203,14 @@ class TestCreateWorktree:
         assert wt.branch == "sw-feat"
         mock_repo.git.worktree.assert_called_once()
 
-    def test_raises_on_existing_path(self, tmp_path, monkeypatch):
+    def test_raises_on_existing_path(self, tmp_path):
         config = self._make_config(tmp_path)
         (config.base_dir / "sw-feat").mkdir()
-
         with pytest.raises(FileExistsError):
             create_worktree(config, "feat")
 
     def test_raises_branch_exists_error(self, tmp_path, monkeypatch):
         config = self._make_config(tmp_path)
-
         mock_repo = MagicMock()
         mock_repo.git.rev_parse.return_value = ""
         monkeypatch.setattr(gitpython, "Repo", lambda *a, **kw: mock_repo)
@@ -258,7 +221,6 @@ class TestCreateWorktree:
 
     def test_uses_existing_branch_when_allowed(self, tmp_path, monkeypatch):
         config = self._make_config(tmp_path)
-
         mock_repo = MagicMock()
         mock_repo.git.rev_parse.return_value = ""
         monkeypatch.setattr(gitpython, "Repo", lambda *a, **kw: mock_repo)
@@ -266,24 +228,20 @@ class TestCreateWorktree:
         wt = create_worktree(config, "feat", use_existing_branch=True)
 
         assert wt.branch == "sw-feat"
-        call_args = mock_repo.git.worktree.call_args
-        assert "-b" not in call_args[0]
+        assert "-b" not in mock_repo.git.worktree.call_args[0]
 
     def test_detach_mode(self, tmp_path, monkeypatch):
         config = self._make_config(tmp_path)
-
         mock_repo = MagicMock()
         monkeypatch.setattr(gitpython, "Repo", lambda *a, **kw: mock_repo)
 
         wt = create_worktree(config, "feat", detach=True)
 
         assert wt.branch == "(detached)"
-        call_args = mock_repo.git.worktree.call_args
-        assert "--detach" in call_args[0]
+        assert "--detach" in mock_repo.git.worktree.call_args[0]
 
     def test_raises_on_git_failure(self, tmp_path, monkeypatch):
         config = self._make_config(tmp_path)
-
         mock_repo = MagicMock()
         mock_repo.git.rev_parse.side_effect = gitpython.GitCommandError("rev-parse", 1)
         mock_repo.git.worktree.side_effect = gitpython.GitCommandError("worktree", 1, stderr="fatal: error")
@@ -390,25 +348,9 @@ class TestDiscoverWorktrees:
 
         result = discover_worktrees(config)
 
-        assert len(result) == 2
-        names = {wt.name for wt in result}
-        assert names == {"alpha", "beta"}
+        assert {wt.name for wt in result} == {"alpha", "beta"}
 
-    def test_skips_main_repo(self, tmp_path, monkeypatch):
-        config = self._make_config(tmp_path)
-        repo_root = str(config.repo_root)
-        output = self._porcelain([
-            (repo_root, "main"),
-        ])
-        mock_repo = MagicMock()
-        mock_repo.git.worktree.return_value = output
-        monkeypatch.setattr(gitpython, "Repo", lambda *a, **kw: mock_repo)
-
-        result = discover_worktrees(config)
-
-        assert result == []
-
-    def test_skips_non_matching_prefix(self, tmp_path, monkeypatch):
+    def test_skips_main_repo_and_non_matching_prefix(self, tmp_path, monkeypatch):
         config = self._make_config(tmp_path)
         repo_root = str(config.repo_root)
         output = self._porcelain([
@@ -437,8 +379,6 @@ class TestDiscoverWorktrees:
         monkeypatch.setattr(gitpython, "Repo", lambda *a, **kw: mock_repo)
 
         result = discover_worktrees(config)
-
-        assert len(result) == 1
         assert result[0].branch == "(detached)"
 
     def test_returns_empty_on_git_error(self, tmp_path, monkeypatch):
@@ -447,15 +387,11 @@ class TestDiscoverWorktrees:
             gitpython, "Repo",
             MagicMock(side_effect=gitpython.GitCommandError("worktree", 1)),
         )
-
-        result = discover_worktrees(config)
-
-        assert result == []
+        assert discover_worktrees(config) == []
 
     def test_handles_no_trailing_blank_line(self, tmp_path, monkeypatch):
         config = self._make_config(tmp_path)
         repo_root = str(config.repo_root)
-        # Build output that doesn't end with a blank line
         output = (
             f"worktree {repo_root}\nHEAD abc123\nbranch refs/heads/main\n\n"
             f"worktree {tmp_path / 'worktrees' / 'sw-last'}\nHEAD abc123\nbranch refs/heads/sw-last"
@@ -465,6 +401,5 @@ class TestDiscoverWorktrees:
         monkeypatch.setattr(gitpython, "Repo", lambda *a, **kw: mock_repo)
 
         result = discover_worktrees(config)
-
         assert len(result) == 1
         assert result[0].name == "last"

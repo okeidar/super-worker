@@ -23,14 +23,20 @@ TUI and CLI for managing multiple Claude Code sessions across git worktrees.
 ## Install
 
 ```bash
-# From PyPI (when published)
-pip install super-worker
-
-# From source
+# Quick setup (installs dependencies + sw globally)
 git clone https://github.com/okeidar/super-worker.git
 cd super-worker
-pip install .
+./setup.sh
 ```
+
+Or manually with [pipx](https://pipx.pypa.io/) (recommended):
+
+```bash
+git clone https://github.com/okeidar/super-worker.git
+pipx install -e ./super-worker
+```
+
+This makes `sw` available globally from any terminal, without activating a venv.
 
 ## Quick Start
 
@@ -109,6 +115,8 @@ Global defaults can be set in `~/.config/sw/config.toml` (same format). Project 
 pip install -e ".[dev]"
 pytest
 ```
+
+If you installed via `pipx`, code changes in the repo take effect immediately (editable mode).
 
 ## License
 

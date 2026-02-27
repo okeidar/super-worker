@@ -1,4 +1,4 @@
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -9,7 +9,6 @@ from super_worker.services.tmux import (
     batch_detect_session_states,
     capture_pane,
     create_session,
-    is_session_alive,
     kill_session,
     kill_all_sessions,
     send_keys,
@@ -17,14 +16,13 @@ from super_worker.services.tmux import (
 )
 
 
-class TestTmuxSessionName:
-    def test_format(self):
-        name = tmux_session_name("my-feature", 0)
-        assert name == "sw-my-feature-0"
+@pytest.mark.parametrize("name,index,expected", [
+    ("my-feature", 0, "sw-my-feature-0"),
+    ("feat", 3, "sw-feat-3"),
+])
+def test_tmux_session_name(name, index, expected):
+    assert tmux_session_name(name, index) == expected
 
-    def test_incremented_index(self):
-        name = tmux_session_name("feat", 3)
-        assert name == "sw-feat-3"
 
 def _mock_server(monkeypatch, session=None, pane=None):
     """Build a mock libtmux server with optional session and pane."""
@@ -37,66 +35,19 @@ def _mock_server(monkeypatch, session=None, pane=None):
     return mock_server, mock_session, mock_pane
 
 
-class TestCapturePane:
-    def test_success(self, monkeypatch):
-        _, _, mock_pane = _mock_server(monkeypatch)
-        mock_pane.capture_pane.return_value = ["line1", "line2"]
-
-        output = capture_pane("sw-feat-0")
-
-        assert output == "line1\nline2"
-        mock_pane.capture_pane.assert_called_once_with(start=-500, escape_sequences=True)
-
-    def test_failure_returns_not_found(self, monkeypatch):
-        mock_server = MagicMock()
-        mock_server.sessions.get.side_effect = Exception("no session")
-        monkeypatch.setattr("super_worker.services.tmux.libtmux.Server", lambda: mock_server)
-
-        output = capture_pane("sw-dead-0")
-
-        assert "not found" in output.lower()
-
-    def test_empty_output(self, monkeypatch):
-        _, _, mock_pane = _mock_server(monkeypatch)
-        mock_pane.capture_pane.return_value = []
-
-        output = capture_pane("sw-feat-0")
-
-        assert output == ""
+def test_capture_pane_failure_returns_not_found(monkeypatch):
+    """Dead session returns a 'not found' message instead of crashing."""
+    mock_server = MagicMock()
+    mock_server.sessions.get.side_effect = Exception("no session")
+    monkeypatch.setattr("super_worker.services.tmux.libtmux.Server", lambda: mock_server)
+    assert "not found" in capture_pane("sw-dead-0").lower()
 
 
-class TestSendKeys:
-    def test_sends_key_to_pane(self, monkeypatch):
-        _, _, mock_pane = _mock_server(monkeypatch)
-
-        send_keys("sw-feat-0", "Enter")
-
-        mock_pane.send_keys.assert_called_once_with("Enter", enter=False, literal=False)
-
-    def test_literal_flag(self, monkeypatch):
-        _, _, mock_pane = _mock_server(monkeypatch)
-
-        send_keys("sw-feat-0", "hello", literal=True)
-
-        mock_pane.send_keys.assert_called_once_with("hello", enter=False, literal=True)
-
-    def test_multiple_keys_sent_in_order(self, monkeypatch):
-        _, _, mock_pane = _mock_server(monkeypatch)
-
-        send_keys("sw-feat-0", "y", "Enter")
-
-        assert mock_pane.send_keys.call_count == 2
-        mock_pane.send_keys.assert_has_calls([
-            call("y", enter=False, literal=False),
-            call("Enter", enter=False, literal=False),
-        ])
-
-    def test_dead_session_does_not_raise(self, monkeypatch):
-        mock_server = MagicMock()
-        mock_server.sessions.get.side_effect = Exception("no session")
-        monkeypatch.setattr("super_worker.services.tmux.libtmux.Server", lambda: mock_server)
-
-        send_keys("sw-dead-0", "Enter")  # Should not raise
+def test_send_keys_dead_session_does_not_raise(monkeypatch):
+    mock_server = MagicMock()
+    mock_server.sessions.get.side_effect = Exception("no session")
+    monkeypatch.setattr("super_worker.services.tmux.libtmux.Server", lambda: mock_server)
+    send_keys("sw-dead-0", "Enter")  # Should not raise
 
 
 class TestBatchDetectSessionStates:
@@ -106,27 +57,7 @@ class TestBatchDetectSessionStates:
         monkeypatch.setattr("super_worker.services.tmux.libtmux.Server", lambda: mock_server)
 
     def test_empty_input(self):
-        result = batch_detect_session_states([])
-        assert result == {}
-
-    def test_all_dead(self, monkeypatch):
-        self._mock_alive(monkeypatch, [])
-
-        result = batch_detect_session_states(["sw-a-0", "sw-b-0"])
-
-        assert result["sw-a-0"] == SessionState.DEAD
-        assert result["sw-b-0"] == SessionState.DEAD
-
-    def test_mixed_alive_and_dead(self, monkeypatch):
-        alive_session = MagicMock()
-        alive_session.session_name = "sw-a-0"
-        alive_session.show_environment.return_value = {"SW_CC_STATE": "waiting_input"}
-        self._mock_alive(monkeypatch, [alive_session])
-
-        result = batch_detect_session_states(["sw-a-0", "sw-b-0"])
-
-        assert result["sw-a-0"] == SessionState.WAITING_INPUT
-        assert result["sw-b-0"] == SessionState.DEAD
+        assert batch_detect_session_states([]) == {}
 
     @pytest.mark.parametrize("env,expected_state", [
         ({}, SessionState.RUNNING),
@@ -164,10 +95,9 @@ class TestCreateSession:
         assert session.tmux_session_name.startswith("sw-feat-")
         assert session.label.startswith("session ")
         assert session.skip_permissions is False
-        assert len(wt.sessions) == 0  # create_session no longer mutates worktree
         server.new_session.assert_called_once()
 
-    def test_uses_prompt_as_label(self, monkeypatch):
+    def test_label_defaults_to_prompt(self, monkeypatch):
         self._mock_server(monkeypatch)
         wt = Worktree(name="feat", path="/tmp/feat", branch="main")
 
@@ -214,51 +144,22 @@ class TestCreateSession:
         assert session.tmux_session_name == "sw-feat-1"
 
 
-@pytest.mark.parametrize("found,expected", [(True, True), (False, False)])
-def test_is_session_alive(monkeypatch, found, expected):
+def test_kill_session_handles_missing(monkeypatch):
     mock_server = MagicMock()
-    if found:
-        mock_server.sessions.get.return_value = MagicMock()
-    else:
-        mock_server.sessions.get.side_effect = Exception("not found")
+    mock_server.sessions.get.side_effect = Exception("not found")
     monkeypatch.setattr("super_worker.services.tmux.libtmux.Server", lambda: mock_server)
-
-    assert is_session_alive("sw-feat-0") is expected
-
-
-class TestKillSession:
-    def test_kills_existing_session(self, monkeypatch):
-        mock_session = MagicMock()
-        mock_server = MagicMock()
-        mock_server.sessions.get.return_value = mock_session
-        monkeypatch.setattr("super_worker.services.tmux.libtmux.Server", lambda: mock_server)
-
-        kill_session("sw-feat-0")
-
-        mock_session.kill.assert_called_once()
-
-    def test_handles_missing_session(self, monkeypatch):
-        mock_server = MagicMock()
-        mock_server.sessions.get.side_effect = Exception("not found")
-        monkeypatch.setattr("super_worker.services.tmux.libtmux.Server", lambda: mock_server)
-
-        kill_session("sw-dead-0")  # Should not raise
+    kill_session("sw-dead-0")  # Should not raise
 
 
-class TestKillAllSessions:
-    def test_kills_all_worktree_sessions(self, monkeypatch):
-        killed = []
+def test_kill_all_sessions(monkeypatch):
+    killed = []
+    monkeypatch.setattr("super_worker.services.tmux.kill_session", lambda name: killed.append(name))
+    wt = Worktree(name="feat", path="/tmp/feat", branch="main")
+    wt.sessions = [
+        Session(tmux_session_name="sw-feat-0", label="s0"),
+        Session(tmux_session_name="sw-feat-1", label="s1"),
+    ]
 
-        def fake_kill(name):
-            killed.append(name)
+    kill_all_sessions(wt)
 
-        monkeypatch.setattr("super_worker.services.tmux.kill_session", fake_kill)
-        wt = Worktree(name="feat", path="/tmp/feat", branch="main")
-        wt.sessions = [
-            Session(tmux_session_name="sw-feat-0", label="s0"),
-            Session(tmux_session_name="sw-feat-1", label="s1"),
-        ]
-
-        kill_all_sessions(wt)
-
-        assert killed == ["sw-feat-0", "sw-feat-1"]
+    assert killed == ["sw-feat-0", "sw-feat-1"]

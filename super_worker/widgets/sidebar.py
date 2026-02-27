@@ -235,8 +235,11 @@ class SessionSidebar(Vertical):
             self.post_message(GitAction(self._worktree, "pr"))
 
     def action_delete_session(self) -> None:
-        sess_list = self.query_one("#session-list", ListView)
-        idx = sess_list.index
-        if idx is not None and idx in self._session_map and self._worktree:
-            session = self._session_map[idx]
-            self.post_message(SessionDeleted(self._worktree, session))
+        if not self._worktree:
+            return
+        # Find the active session from the app's state
+        active_name = self.app._active_session_name  # type: ignore[attr-defined]
+        if active_name:
+            session = next((s for s in self._worktree.sessions if s.tmux_session_name == active_name), None)
+            if session:
+                self.post_message(SessionDeleted(self._worktree, session))

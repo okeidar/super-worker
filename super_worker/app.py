@@ -282,6 +282,16 @@ class SuperWorkerApp(App):
         except Exception:
             pass
 
+        # Auto-select another session after deletion
+        if wt.sessions:
+            next_session = wt.sessions[0]
+            self._active_session_name = next_session.tmux_session_name
+            try:
+                wtc = self.query_one(f"#wtc-{wt.name}", WorktreeTabContent)
+                wtc.query_one(TerminalPane).active_session = next_session.tmux_session_name
+            except Exception:
+                pass
+
         self.notify(f"Deleted session: {session.label}")
 
         # Kill tmux + save state in background (non-blocking via asyncio)
@@ -626,8 +636,16 @@ class SuperWorkerApp(App):
                     before=footer,
                 )
             else:
-                first = self._state.worktrees[0]
-                self._set_active_worktree(first)
+                # Let TabbedContent decide which tab is now active and sync to it
+                active_tab = tabs.active
+                if active_tab and active_tab.startswith("wt-"):
+                    wt_name = active_tab[3:]
+                    wt = self._state.get_worktree(wt_name)
+                    if wt:
+                        self._set_active_worktree(wt)
+                        return
+                # Fallback: activate the first worktree
+                self._set_active_worktree(self._state.worktrees[0])
         except Exception:
             logger.debug("Failed to remove worktree tab", exc_info=True, extra={"name": name})
 
