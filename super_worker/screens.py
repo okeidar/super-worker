@@ -12,10 +12,53 @@ from textual.widgets import Button, Checkbox, Input, Label
 from super_worker.config import ResolvedConfig, SWConfig, WorktreeConfig, EnvConfig, GitConfig, UIConfig, load_toml
 
 
-class NewWorktreeScreen(ModalScreen[tuple[str, str | None, str | None, bool, bool] | None]):
+class ModalCheckbox(Checkbox):
+    """Checkbox that only toggles on space, not enter.
+
+    In modals, enter should submit the form, not toggle a checkbox.
+    Space toggles the value. Enter is passed through to the screen.
+    """
+
+    _last_key: str = ""
+
+    def on_key(self, event) -> None:
+        self._last_key = event.key
+
+    def action_toggle_button(self) -> None:
+        if self._last_key == "enter":
+            # Don't toggle — find and run the screen's enter binding action
+            for binding in self.screen.BINDINGS:
+                if "enter" in binding.key:
+                    self.call_later(self.screen.run_action, binding.action)
+                    return
+            return
+        super().action_toggle_button()
+
+
+_NAV_BINDINGS = [
+    Binding("down", "focus_next_field", "Next field", show=False),
+    Binding("up", "focus_prev_field", "Previous field", show=False),
+]
+
+
+class _ModalNavMixin:
+    """Mixin adding up/down arrow navigation between focusable widgets in modals."""
+
+    def action_focus_next_field(self) -> None:
+        self.focus_next()
+
+    def action_focus_prev_field(self) -> None:
+        self.focus_previous()
+
+
+class NewWorktreeScreen(_ModalNavMixin, ModalScreen[tuple[str, str | None, str | None, bool, bool] | None]):
     """Modal dialog for creating a new worktree."""
 
-    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("enter", "submit", "Create", show=False),
+        *_NAV_BINDINGS,
+    ]
 
     DEFAULT_CSS = """
     NewWorktreeScreen {
@@ -43,34 +86,38 @@ class NewWorktreeScreen(ModalScreen[tuple[str, str | None, str | None, bool, boo
             yield Input(placeholder=self._config.branch_placeholder, id="wt-branch")
             yield Label("Initial prompt (optional, e.g. /plan):")
             yield Input(placeholder="/plan", id="wt-prompt")
-            yield Checkbox("No new branch (detached HEAD)", id="wt-detach")
-            yield Checkbox("Skip permissions", id="wt-skip-perms")
+            yield ModalCheckbox("No new branch (detached HEAD)", id="wt-detach")
+            yield ModalCheckbox("Skip permissions", id="wt-skip-perms")
             yield Label("Press Enter to create, Escape to cancel")
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
-        name_input = self.query_one("#wt-name", Input)
-        branch_input = self.query_one("#wt-branch", Input)
-        prompt_input = self.query_one("#wt-prompt", Input)
-        detach_cb = self.query_one("#wt-detach", Checkbox)
-        skip_perms_cb = self.query_one("#wt-skip-perms", Checkbox)
-        name = name_input.value.strip()
+        self.action_submit()
+
+    def action_submit(self) -> None:
+        name = self.query_one("#wt-name", Input).value.strip()
         if not name:
             return
         if not re.fullmatch(r"[a-zA-Z0-9_-]+", name):
             self.notify("Name must contain only letters, digits, hyphens, and underscores", severity="error")
             return
-        branch = branch_input.value.strip() or None
-        prompt = prompt_input.value.strip() or None
-        self.dismiss((name, branch, prompt, detach_cb.value, skip_perms_cb.value))
+        branch = self.query_one("#wt-branch", Input).value.strip() or None
+        prompt = self.query_one("#wt-prompt", Input).value.strip() or None
+        detach = self.query_one("#wt-detach", Checkbox).value
+        skip_perms = self.query_one("#wt-skip-perms", Checkbox).value
+        self.dismiss((name, branch, prompt, detach, skip_perms))
 
     def action_cancel(self) -> None:
         self.dismiss(None)
 
 
-class NewSessionScreen(ModalScreen[tuple[str | None, str | None, bool] | None]):
+class NewSessionScreen(_ModalNavMixin, ModalScreen[tuple[str | None, str | None, bool] | None]):
     """Modal dialog for adding a session to the current worktree."""
 
-    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("enter", "submit", "Create", show=False),
+        *_NAV_BINDINGS,
+    ]
 
     DEFAULT_CSS = """
     NewSessionScreen {
@@ -92,10 +139,13 @@ class NewSessionScreen(ModalScreen[tuple[str | None, str | None, bool] | None]):
             yield Input(placeholder="/execute", id="sess-prompt")
             yield Label("Label (optional):")
             yield Input(placeholder="", id="sess-label")
-            yield Checkbox("Skip permissions", id="sess-skip-perms")
+            yield ModalCheckbox("Skip permissions", id="sess-skip-perms")
             yield Label("Press Enter to create, Escape to cancel")
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.action_submit()
+
+    def action_submit(self) -> None:
         prompt = self.query_one("#sess-prompt", Input).value.strip() or None
         label = self.query_one("#sess-label", Input).value.strip() or None
         skip_perms = self.query_one("#sess-skip-perms", Checkbox).value
@@ -105,10 +155,14 @@ class NewSessionScreen(ModalScreen[tuple[str | None, str | None, bool] | None]):
         self.dismiss(None)
 
 
-class RenameSessionScreen(ModalScreen[str | None]):
+class RenameSessionScreen(_ModalNavMixin, ModalScreen[str | None]):
     """Modal dialog for renaming a session."""
 
-    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("enter", "submit", "Rename", show=False),
+        *_NAV_BINDINGS,
+    ]
 
     DEFAULT_CSS = """
     RenameSessionScreen {
@@ -134,6 +188,9 @@ class RenameSessionScreen(ModalScreen[str | None]):
             yield Label("Press Enter to rename, Escape to cancel")
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.action_submit()
+
+    def action_submit(self) -> None:
         new_label = self.query_one("#rename-input", Input).value.strip()
         self.dismiss(new_label if new_label else None)
 
@@ -141,10 +198,14 @@ class RenameSessionScreen(ModalScreen[str | None]):
         self.dismiss(None)
 
 
-class ConfirmDeleteScreen(ModalScreen[bool]):
+class ConfirmDeleteScreen(_ModalNavMixin, ModalScreen[bool]):
     """Confirmation dialog for deleting a worktree."""
 
-    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("enter", "confirm", "Confirm", show=False),
+        *_NAV_BINDINGS,
+    ]
 
     DEFAULT_CSS = """
     ConfirmDeleteScreen {
@@ -181,14 +242,21 @@ class ConfirmDeleteScreen(ModalScreen[bool]):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         self.dismiss(event.button.id == "btn-confirm")
 
+    def action_confirm(self) -> None:
+        self.dismiss(True)
+
     def action_cancel(self) -> None:
         self.dismiss(False)
 
 
-class CommitMessageScreen(ModalScreen[str | None]):
+class CommitMessageScreen(_ModalNavMixin, ModalScreen[str | None]):
     """Modal dialog for entering a commit message."""
 
-    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("enter", "submit", "Commit", show=False),
+        *_NAV_BINDINGS,
+    ]
 
     DEFAULT_CSS = """
     CommitMessageScreen {
@@ -214,6 +282,9 @@ class CommitMessageScreen(ModalScreen[str | None]):
             yield Label("Press Enter to commit all changes, Escape to cancel")
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.action_submit()
+
+    def action_submit(self) -> None:
         msg = self.query_one("#commit-msg", Input).value.strip()
         if msg:
             self.dismiss(msg)
@@ -222,10 +293,14 @@ class CommitMessageScreen(ModalScreen[str | None]):
         self.dismiss(None)
 
 
-class BranchExistsScreen(ModalScreen[str]):
+class BranchExistsScreen(_ModalNavMixin, ModalScreen[str]):
     """Ask user what to do when branch already exists."""
 
-    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("enter", "use_existing", "Use Existing", show=False),
+        *_NAV_BINDINGS,
+    ]
 
     DEFAULT_CSS = """
     BranchExistsScreen {
@@ -265,14 +340,21 @@ class BranchExistsScreen(ModalScreen[str]):
         else:
             self.dismiss("cancel")
 
+    def action_use_existing(self) -> None:
+        self.dismiss("use")
+
     def action_cancel(self) -> None:
         self.dismiss("cancel")
 
 
-class ProjectSelectorScreen(ModalScreen[str | None]):
+class ProjectSelectorScreen(_ModalNavMixin, ModalScreen[str | None]):
     """Modal to select a project from known repos or browse for a new one."""
 
-    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("enter", "submit", "Select", show=False),
+        *_NAV_BINDINGS,
+    ]
 
     DEFAULT_CSS = """
     ProjectSelectorScreen {
@@ -321,6 +403,9 @@ class ProjectSelectorScreen(ModalScreen[str | None]):
                 return
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.action_submit()
+
+    def action_submit(self) -> None:
         path = self.query_one("#browse-input", Input).value.strip()
         if path:
             self.dismiss(path)
@@ -329,10 +414,14 @@ class ProjectSelectorScreen(ModalScreen[str | None]):
         self.dismiss(None)
 
 
-class ConfigScreen(ModalScreen[SWConfig | None]):
+class ConfigScreen(_ModalNavMixin, ModalScreen[SWConfig | None]):
     """Modal to edit project .sw.toml settings."""
 
-    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("enter", "save", "Save", show=False),
+        *_NAV_BINDINGS,
+    ]
 
     DEFAULT_CSS = """
     ConfigScreen {
@@ -431,6 +520,9 @@ class ConfigScreen(ModalScreen[SWConfig | None]):
             self.dismiss(self._collect())
         else:
             self.dismiss(None)
+
+    def action_save(self) -> None:
+        self.dismiss(self._collect())
 
     def action_cancel(self) -> None:
         self.dismiss(None)
