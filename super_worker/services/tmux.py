@@ -1,5 +1,6 @@
 import logging
 import shlex
+import time
 from enum import Enum
 
 import libtmux
@@ -8,6 +9,46 @@ from super_worker.constants import TMUX_SESSION_PREFIX
 from super_worker.models import Session, Worktree
 
 logger = logging.getLogger(__name__)
+
+# Cached server and pane references to avoid repeated subprocess calls.
+# libtmux.Server() is cheap, but .sessions.get() triggers `tmux list-sessions`.
+_server: libtmux.Server | None = None
+_pane_cache: dict[str, tuple[float, libtmux.Pane]] = {}  # session_name -> (timestamp, pane)
+_PANE_CACHE_TTL = 30.0  # seconds
+
+
+def _get_server() -> libtmux.Server:
+    global _server
+    if _server is None:
+        _server = libtmux.Server()
+    return _server
+
+
+def _get_pane(session_name: str) -> libtmux.Pane | None:
+    """Get cached pane reference, refreshing if stale."""
+    now = time.monotonic()
+    if session_name in _pane_cache:
+        ts, pane = _pane_cache[session_name]
+        if now - ts < _PANE_CACHE_TTL:
+            return pane
+
+    server = _get_server()
+    try:
+        session = server.sessions.get(session_name=session_name)
+        pane = session.active_pane
+        _pane_cache[session_name] = (now, pane)
+        return pane
+    except Exception:
+        _pane_cache.pop(session_name, None)
+        return None
+
+
+def invalidate_pane_cache(session_name: str | None = None) -> None:
+    """Clear cached pane references."""
+    if session_name:
+        _pane_cache.pop(session_name, None)
+    else:
+        _pane_cache.clear()
 
 
 class SessionState(Enum):
@@ -30,7 +71,7 @@ def tmux_session_name(worktree_name: str, index: int) -> str:
 
 def _find_available_session_name(worktree: Worktree) -> str:
     """Find next available tmux session name, avoiding collisions."""
-    server = libtmux.Server()
+    server = _get_server()
     existing = {s.session_name for s in server.sessions}
     index = len(worktree.sessions)
     for _ in range(1000):
@@ -49,7 +90,7 @@ def create_session(
     resume: bool = False,
 ) -> Session:
     """Create a tmux session running claude in the worktree directory."""
-    server = libtmux.Server()
+    server = _get_server()
     sess_name = _find_available_session_name(worktree)
 
     session_label = label or prompt or f"session {len(worktree.sessions)}"
@@ -79,36 +120,35 @@ def create_session(
 
 def capture_pane(tmux_session_name: str) -> str:
     """Capture pane content with scrollback history and ANSI escapes."""
-    server = libtmux.Server()
-    try:
-        session = server.sessions.get(session_name=tmux_session_name)
-    except Exception:
+    pane = _get_pane(tmux_session_name)
+    if pane is None:
         return f"[Session {tmux_session_name} not found]"
-
     try:
-        lines = session.active_pane.capture_pane(start=-500, escape_sequences=True)
+        lines = pane.capture_pane(start=-500, escape_sequences=True)
         return "\n".join(lines)
     except Exception:
+        invalidate_pane_cache(tmux_session_name)
         return f"[Session {tmux_session_name} not found]"
 
 
 def send_keys(tmux_session_name: str, *keys: str, literal: bool = False) -> None:
     """Send keystrokes to a tmux session."""
-    server = libtmux.Server()
+    pane = _get_pane(tmux_session_name)
+    if pane is None:
+        logger.debug("Failed to send keys to tmux session", extra={"session": tmux_session_name})
+        return
     try:
-        session = server.sessions.get(session_name=tmux_session_name)
-        pane = session.active_pane
         for key in keys:
             pane.send_keys(key, enter=False, literal=literal)
     except Exception:
+        invalidate_pane_cache(tmux_session_name)
         logger.debug("Failed to send keys to tmux session", extra={"session": tmux_session_name})
 
 
 def is_session_alive(tmux_session_name: str) -> bool:
     """Check if a tmux session exists."""
-    server = libtmux.Server()
     try:
-        server.sessions.get(session_name=tmux_session_name)
+        _get_server().sessions.get(session_name=tmux_session_name)
         return True
     except Exception:
         return False
@@ -119,7 +159,7 @@ def batch_detect_session_states(session_names: list[str]) -> dict[str, SessionSt
     if not session_names:
         return {}
 
-    server = libtmux.Server()
+    server = _get_server()
     try:
         live_sessions = {s.session_name: s for s in server.sessions}
     except Exception:
@@ -144,9 +184,8 @@ def batch_detect_session_states(session_names: list[str]) -> dict[str, SessionSt
 
 def enable_mouse(tmux_session_name: str) -> None:
     """Enable mouse support on a tmux session."""
-    server = libtmux.Server()
     try:
-        session = server.sessions.get(session_name=tmux_session_name)
+        session = _get_server().sessions.get(session_name=tmux_session_name)
         session.set_option("mouse", "on")
     except Exception:
         logger.debug("Failed to enable mouse on tmux session", extra={"session": tmux_session_name})
@@ -154,12 +193,12 @@ def enable_mouse(tmux_session_name: str) -> None:
 
 def kill_session(tmux_session_name: str) -> None:
     """Kill a tmux session."""
-    server = libtmux.Server()
     try:
-        session = server.sessions.get(session_name=tmux_session_name)
+        session = _get_server().sessions.get(session_name=tmux_session_name)
         session.kill()
     except Exception:
         logger.debug("Failed to kill tmux session", extra={"session": tmux_session_name})
+    invalidate_pane_cache(tmux_session_name)
 
 
 def kill_all_sessions(worktree: Worktree) -> None:

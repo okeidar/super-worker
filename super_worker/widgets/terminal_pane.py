@@ -2,7 +2,7 @@ import logging
 import re
 
 from rich.text import Text
-from textual.events import Key, Paste
+from textual.events import Click, Key, Paste
 from textual.reactive import reactive
 from textual.app import ComposeResult
 from textual.widget import Widget
@@ -119,11 +119,30 @@ class TerminalPane(Widget, can_focus=True):
             self._timer.stop()
             self._timer = None
 
+    def _send_keys_async(self, *keys: str, literal: bool = False) -> None:
+        """Send keys in a background thread to avoid blocking the event loop."""
+        session = self.active_session
+        if not session:
+            return
+
+        def _send_and_capture():
+            send_keys(session, *keys, literal=literal)
+            # Trigger an immediate capture so the user sees their keystroke
+            # reflected without waiting for the next poll cycle.
+            return self._capture(session)
+
+        self.run_worker(_send_and_capture, thread=True, group="send-keys")
+
+    def on_click(self, event: Click) -> None:
+        """Consume clicks so the Static child doesn't trigger text selection."""
+        event.stop()
+        self.focus()
+
     def on_paste(self, event: Paste) -> None:
         if not self.active_session or not event.text:
             return
         event.stop()
-        send_keys(self.active_session, event.text, literal=True)
+        self._send_keys_async(event.text, literal=True)
 
     def on_key(self, event: Key) -> None:
         if not self.active_session:
@@ -139,13 +158,13 @@ class TerminalPane(Widget, can_focus=True):
         if key in self._NEWLINE_KEYS:
             # Forward as Alt+Enter (ESC followed by Enter) so Claude Code
             # interprets it as "insert newline" rather than "submit".
-            send_keys(self.active_session, "Escape", "Enter")
+            self._send_keys_async("Escape", "Enter")
         elif key in self._SPECIAL_KEY_MAP:
-            send_keys(self.active_session, self._SPECIAL_KEY_MAP[key])
+            self._send_keys_async(self._SPECIAL_KEY_MAP[key])
         elif event.character and len(event.character) == 1:
             # Send printable characters as literal text so that '/', ';',
             # and other tmux-special characters arrive unmangled.
-            send_keys(self.active_session, event.character, literal=True)
+            self._send_keys_async(event.character, literal=True)
         elif key.startswith("ctrl+"):
             letter = key.split("+", 1)[1]
-            send_keys(self.active_session, f"C-{letter}")
+            self._send_keys_async(f"C-{letter}")
