@@ -148,7 +148,7 @@ class SessionSidebar(Vertical):
         snapshot_parts = []
         for s in worktree.sessions:
             state = states.get(s.tmux_session_name, SessionState.RUNNING)
-            snapshot_parts.append(f"{s.id}:{s.label}:{state.value}")
+            snapshot_parts.append(f"{s.id}:{s.label}:{s.session_type}:{state.value}")
         snapshot = "|".join(snapshot_parts)
 
         if snapshot == self._prev_session_snapshot and not is_new_worktree:
@@ -168,7 +168,8 @@ class SessionSidebar(Vertical):
         for i, s in enumerate(worktree.sessions):
             state = states.get(s.tmux_session_name, SessionState.RUNNING)
             dot = self._state_dot(state)
-            label_text = f"{dot} {s.label}"
+            tag = "[dim]sh[/]" if s.session_type == "terminal" else "[dim]CC[/]"
+            label_text = f"{dot} {tag} {s.label}"
             self._session_map[i] = s
 
             if i < current_count:
@@ -237,9 +238,9 @@ class SessionSidebar(Vertical):
     def action_delete_session(self) -> None:
         if not self._worktree:
             return
-        # Find the active session from the app's state
-        active_name = self.app._active_session_name  # type: ignore[attr-defined]
-        if active_name:
-            session = next((s for s in self._worktree.sessions if s.tmux_session_name == active_name), None)
-            if session:
-                self.post_message(SessionDeleted(self._worktree, session))
+        # Delete the session highlighted in the ListView, not the app's active session
+        sess_list = self.query_one("#session-list", ListView)
+        idx = sess_list.index
+        if idx is not None and idx in self._session_map:
+            session = self._session_map[idx]
+            self.post_message(SessionDeleted(self._worktree, session))

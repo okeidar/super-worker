@@ -174,7 +174,6 @@ class TestRecoverDeadSessions:
 
         def fake_create(worktree, **kwargs):
             new_s = Session(tmux_session_name="sw-feat-1", label=kwargs.get("label", "new"))
-            worktree.sessions.append(new_s)
             created_kwargs.append(kwargs)
             return new_s
 
@@ -206,9 +205,7 @@ class TestRecoverDeadSessions:
         )
 
         def fake_create(worktree, **kwargs):
-            new_s = Session(tmux_session_name="sw-feat-2", label=kwargs.get("label", "new"))
-            worktree.sessions.append(new_s)
-            return new_s
+            return Session(tmux_session_name="sw-feat-2", label=kwargs.get("label", "new"))
 
         monkeypatch.setattr("super_worker.services.state.create_session", fake_create)
 
@@ -217,3 +214,45 @@ class TestRecoverDeadSessions:
         assert len(sessions) == 2
         assert sessions[0].tmux_session_name == "sw-feat-0"
         assert sessions[1].label == "(resumed)"
+
+    def test_dead_terminal_sessions_dropped_without_resume(self, tmp_path, monkeypatch):
+        """Dead terminal sessions are dropped — nothing to --continue."""
+        wt_path = tmp_path / "feat"
+        wt_path.mkdir()
+        s = Session(tmux_session_name="sw-feat-0", label="my-shell", session_type="terminal")
+        wt = Worktree(name="feat", path=str(wt_path), branch="sw-feat", sessions=[s])
+        state = AppState(repo_root=str(tmp_path), worktree_base=str(tmp_path), worktrees=[wt])
+
+        monkeypatch.setattr("super_worker.services.state.is_session_alive", lambda name: False)
+        create_called = []
+        monkeypatch.setattr("super_worker.services.state.create_session", lambda *a, **kw: create_called.append(1))
+
+        assert recover_dead_sessions(state) is True
+        assert state.worktrees[0].sessions == []
+        assert create_called == [], "create_session should not be called for dead terminal sessions"
+
+    def test_mixed_dead_claude_and_terminal(self, tmp_path, monkeypatch):
+        """Dead claude sessions get resumed; dead terminal sessions are dropped."""
+        wt_path = tmp_path / "feat"
+        wt_path.mkdir()
+        alive_s = Session(tmux_session_name="sw-feat-0", label="alive")
+        dead_claude = Session(tmux_session_name="sw-feat-1", label="dead-cc")
+        dead_term = Session(tmux_session_name="sw-feat-2", label="dead-term", session_type="terminal")
+        wt = Worktree(name="feat", path=str(wt_path), branch="sw-feat", sessions=[alive_s, dead_claude, dead_term])
+        state = AppState(repo_root=str(tmp_path), worktree_base=str(tmp_path), worktrees=[wt])
+
+        monkeypatch.setattr(
+            "super_worker.services.state.is_session_alive",
+            lambda name: name == "sw-feat-0",
+        )
+
+        def fake_create(worktree, **kwargs):
+            return Session(tmux_session_name="sw-feat-3", label=kwargs.get("label", "new"))
+
+        monkeypatch.setattr("super_worker.services.state.create_session", fake_create)
+
+        assert recover_dead_sessions(state) is True
+        sessions = state.worktrees[0].sessions
+        assert len(sessions) == 2
+        assert sessions[0].tmux_session_name == "sw-feat-0"  # alive kept
+        assert sessions[1].label == "(resumed)"  # dead claude resumed

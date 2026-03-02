@@ -1,4 +1,5 @@
 import logging
+import os
 import shlex
 import time
 from enum import Enum
@@ -88,19 +89,24 @@ def create_session(
     label: str | None = None,
     skip_permissions: bool = False,
     resume: bool = False,
+    session_type: str = "claude",
 ) -> Session:
-    """Create a tmux session running claude in the worktree directory."""
+    """Create a tmux session running claude or a plain shell in the worktree directory."""
     server = _get_server()
     sess_name = _find_available_session_name(worktree)
 
-    session_label = label or prompt or f"session {len(worktree.sessions)}"
-
-    base = "claude --dangerously-skip-permissions" if skip_permissions else "claude"
-    if resume:
-        base = f"{base} --continue"
-    elif prompt:
-        base = f"{base} {shlex.quote(prompt)}"
-    cmd = f"env SW_SESSION_NAME={shlex.quote(sess_name)} TERM=xterm-256color {base}"
+    if session_type == "terminal":
+        session_label = label or "terminal"
+        shell = os.environ.get("SHELL", "/bin/bash")
+        cmd = f"env SW_SESSION_NAME={shlex.quote(sess_name)} TERM=xterm-256color {shlex.quote(shell)}"
+    else:
+        session_label = label or prompt or f"session {len(worktree.sessions)}"
+        base = "claude --dangerously-skip-permissions" if skip_permissions else "claude"
+        if resume:
+            base = f"{base} --continue"
+        elif prompt:
+            base = f"{base} {shlex.quote(prompt)}"
+        cmd = f"env SW_SESSION_NAME={shlex.quote(sess_name)} TERM=xterm-256color {base}"
 
     tmux_session = server.new_session(
         session_name=sess_name,
@@ -112,6 +118,7 @@ def create_session(
     session = Session(
         tmux_session_name=sess_name,
         label=session_label,
+        session_type=session_type,
         initial_prompt=prompt,
         skip_permissions=skip_permissions,
     )

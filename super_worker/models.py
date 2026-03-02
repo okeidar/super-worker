@@ -10,6 +10,7 @@ class Session(BaseModel):
     id: str = Field(default_factory=lambda: uuid4().hex[:8])
     tmux_session_name: str
     label: str
+    session_type: str = Field(default="claude")
     initial_prompt: str | None = None
     skip_permissions: bool = False
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())

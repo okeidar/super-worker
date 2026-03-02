@@ -18,3 +18,13 @@ def test_get_worktree_not_found():
     wt = Worktree(name="feat", path="/tmp/feat", branch="sw-feat")
     state = AppState(repo_root="/repo", worktree_base="/wt", worktrees=[wt])
     assert state.get_worktree("nonexistent") is None
+
+
+def test_session_type_defaults_to_claude():
+    s = Session(tmux_session_name="sw-a-0", label="test")
+    assert s.session_type == "claude"
+
+
+def test_session_type_terminal():
+    s = Session(tmux_session_name="sw-a-0", label="term", session_type="terminal")
+    assert s.session_type == "terminal"
