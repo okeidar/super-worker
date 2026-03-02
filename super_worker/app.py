@@ -17,7 +17,12 @@ from super_worker.services.state import (
     save_state,
     update_projects_registry,
 )
-from super_worker.widgets.project_drawer import ProjectDrawer, ProjectSelected
+from super_worker.widgets.project_drawer import (
+    DockToggled,
+    ProjectDrawer,
+    ProjectSelected,
+    ProjectTabBar,
+)
 from super_worker.widgets.project_view import ProjectView
 
 logger = logging.getLogger(__name__)
@@ -78,7 +83,11 @@ class SuperWorkerApp(App):
 
     def compose(self) -> ComposeResult:
         yield Header()
+        # Docked mode: horizontal tab strip sits here, above worktree tabs.
+        # Hidden by default; shown when user presses the drawer's pin button.
+        yield ProjectTabBar(id="project-tab-bar")
         with Horizontal(id="main-area"):
+            # Overlay mode: left-side drawer, hidden by default (Ctrl+O to toggle).
             yield ProjectDrawer(id="project-drawer")
             with ContentSwitcher(id="project-switcher"):
                 if self._initial_project:
@@ -117,7 +126,7 @@ class SuperWorkerApp(App):
                 name="periodic-refresh",
             )
 
-    # ── Project drawer ────────────────────────────────────────────────────────
+    # ── Project drawer / tab bar ──────────────────────────────────────────────
 
     def _refresh_drawer(self) -> None:
         projects = load_projects_registry()
@@ -125,14 +134,28 @@ class SuperWorkerApp(App):
         open_paths = {str(cfg.repo_root) for cfg in self._open_configs}
         try:
             self.query_one(ProjectDrawer).refresh_projects(projects, current=current, open_paths=open_paths)
+            self.query_one(ProjectTabBar).refresh_projects(open_paths=open_paths, current=current)
         except Exception:
             pass
 
     def action_toggle_project_drawer(self) -> None:
-        try:
+        tab_bar = self.query_one(ProjectTabBar)
+        if tab_bar.has_class("-visible"):
+            # Already docked — Ctrl+O re-opens the floating drawer on top
+            self.query_one(ProjectDrawer).open()
+        else:
             self.query_one(ProjectDrawer).toggle()
-        except Exception:
-            pass
+
+    def on_dock_toggled(self, event: DockToggled) -> None:
+        """Switch between overlay drawer and docked tab bar."""
+        drawer = self.query_one(ProjectDrawer)
+        tab_bar = self.query_one(ProjectTabBar)
+        if event.docked:
+            drawer.close()
+            tab_bar.show()
+        else:
+            tab_bar.hide()
+            drawer.open()
 
     def on_project_selected(self, event: ProjectSelected) -> None:
         async def _open():
