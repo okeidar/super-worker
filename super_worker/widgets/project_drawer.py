@@ -3,11 +3,12 @@
 from pathlib import Path
 
 from textual.app import ComposeResult
-from textual.containers import Horizontal, Vertical
+from textual.containers import Vertical
 from textual.events import Key
 from textual.message import Message
 from textual.widget import Widget
 from textual.widgets import Button, Input, Label, ListItem, ListView, Static
+from textual.containers import Horizontal
 
 
 # ── Messages ─────────────────────────────────────────────────────────────────
@@ -22,10 +23,10 @@ class ProjectSelected(Message):
 
 
 class DockToggled(Message):
-    """Fired when the drawer's pin button is pressed.
+    """Fired when the user pins or unpins the project drawer.
 
-    docked=True  → hide the drawer, show ProjectTabBar above worktree tabs
-    docked=False → hide ProjectTabBar, show drawer as floating overlay
+    docked=True  → hide the side drawer, show ProjectTabBar above worktree tabs
+    docked=False → hide ProjectTabBar, re-open drawer as floating overlay
     """
 
     def __init__(self, docked: bool) -> None:
@@ -33,14 +34,17 @@ class DockToggled(Message):
         super().__init__()
 
 
-# ── ProjectTabBar (docked mode: horizontal tab strip above worktree tabs) ────
+# ── ProjectTabBar ─────────────────────────────────────────────────────────────
 
 
 class ProjectTabBar(Widget):
-    """Horizontal project tab strip.  Shown instead of the drawer when docked.
+    """One-line horizontal tab strip shown above worktree tabs when docked.
+
+    Layout is explicitly horizontal (Widget default is vertical, which would
+    stack children and only show the first one in height:1).
 
     CSS classes:
-      .-visible — makes the bar appear (1 line above worktree tabs)
+      .-visible — makes the bar appear
     """
 
     DEFAULT_CSS = """
@@ -49,17 +53,18 @@ class ProjectTabBar(Widget):
         display: none;
         background: $panel;
         border-bottom: solid $accent;
+        layout: horizontal;
     }
     ProjectTabBar.-visible {
         display: block;
     }
     .proj-tab {
         height: 1;
-        padding: 0 1;
-        min-width: 6;
+        padding: 0 2;
         border: none;
         background: $panel;
         color: $text-muted;
+        min-width: 4;
     }
     .proj-tab:hover {
         background: $accent 15%;
@@ -71,8 +76,8 @@ class ProjectTabBar(Widget):
         text-style: bold;
     }
     #tab-open-btn {
-        width: 5;
         height: 1;
+        width: 8;
         border: none;
         background: $panel;
         color: $text-muted;
@@ -82,15 +87,15 @@ class ProjectTabBar(Widget):
         background: $accent 15%;
     }
     #tab-undock-btn {
-        width: 3;
         height: 1;
+        width: 4;
         border: none;
         background: $panel;
         color: $text-muted;
         dock: right;
     }
     #tab-undock-btn:hover {
-        background: $accent 15%;
+        color: $accent;
     }
     """
 
@@ -100,13 +105,16 @@ class ProjectTabBar(Widget):
         self._current: str | None = None
 
     def compose(self) -> ComposeResult:
-        yield Button("📍", id="tab-undock-btn", tooltip="Undock (show as side panel)")
-        yield Horizontal(id="tab-inner")
+        # Project tabs are mounted dynamically before #tab-open-btn.
+        # #tab-undock-btn is docked to the right edge via CSS.
         yield Button("+ Open", id="tab-open-btn")
+        yield Button("📍", id="tab-undock-btn", tooltip="Undock to side panel")
 
     def on_mount(self) -> None:
         self.query_one("#tab-undock-btn", Button).can_focus = False
         self.query_one("#tab-open-btn", Button).can_focus = False
+
+    # ── Visibility ────────────────────────────────────────────────────────────
 
     def show(self) -> None:
         self.add_class("-visible")
@@ -114,50 +122,59 @@ class ProjectTabBar(Widget):
     def hide(self) -> None:
         self.remove_class("-visible")
 
+    # ── Project list ──────────────────────────────────────────────────────────
+
     def refresh_projects(self, open_paths: set[str], current: str | None) -> None:
         self._open_paths = list(open_paths)
         self._current = current
         self.call_after_refresh(self._rebuild_tabs)
 
     def _rebuild_tabs(self) -> None:
-        try:
-            inner = self.query_one("#tab-inner", Horizontal)
-        except Exception:
-            return
-        inner.remove_children()
+        # Remove existing project tabs, keep the static buttons.
+        for btn in list(self.query(".proj-tab")):
+            btn.remove()
+
+        add_btn = self.query_one("#tab-open-btn", Button)
         for path in self._open_paths:
             name = Path(path).name
             is_active = path == self._current
             btn = Button(name, classes="proj-tab" + (" -active" if is_active else ""))
             btn._project_path = path  # type: ignore[attr-defined]
             btn.can_focus = False
-            inner.mount(btn)
+            # Insert before "+ Open" so order is: [proj tabs] [+ Open] [📍]
+            self.mount(btn, before=add_btn)
+
+    # ── Events ────────────────────────────────────────────────────────────────
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "tab-undock-btn":
             self.post_message(DockToggled(docked=False))
-            return
-        if event.button.id == "tab-open-btn":
-            # Ask app to open the floating drawer as a picker
-            self.post_message(DockToggled(docked=False))
-            return
-        path = getattr(event.button, "_project_path", None)
-        if path:
-            self.post_message(ProjectSelected(path))
+        elif event.button.id == "tab-open-btn":
+            # Open the floating drawer as an overlay picker WITHOUT undocking.
+            try:
+                from super_worker.widgets.project_drawer import ProjectDrawer  # noqa: F401
+                self.app.query_one("#project-drawer").add_class("-open")  # type: ignore[union-attr]
+            except Exception:
+                pass
+        else:
+            path = getattr(event.button, "_project_path", None)
+            if path:
+                self.post_message(ProjectSelected(path))
 
 
-# ── ProjectDrawer (overlay side panel) ───────────────────────────────────────
+# ── ProjectDrawer ─────────────────────────────────────────────────────────────
 
 
 class ProjectDrawer(Widget):
-    """Left-side project switcher panel.
+    """Left-side floating project switcher panel.
 
-    Default: hidden.  Press Ctrl+O to slide it in.  Press the 📌 button or
-    'p' (while drawer is focused) to dock it — this hides the drawer and
+    Default: hidden.
+    Ctrl+O: toggle open/closed as an overlay (side panel).
+    📌 button or 'p' (while drawer focused): dock → hides this panel and
     tells the app to show ProjectTabBar above the worktree tabs instead.
 
     CSS classes:
-      .-open — visible as overlay (Ctrl+O toggle)
+      .-open — visible as left-side overlay
     """
 
     DEFAULT_CSS = """
@@ -180,6 +197,9 @@ class ProjectDrawer(Widget):
         color: $accent;
         background: $panel;
     }
+    #drawer-title {
+        width: 1fr;
+    }
     #drawer-pin-btn {
         width: auto;
         min-width: 3;
@@ -188,6 +208,9 @@ class ProjectDrawer(Widget):
         background: $panel;
         color: $accent;
         padding: 0 1;
+    }
+    #drawer-pin-btn:hover {
+        color: $text;
     }
     #project-list {
         height: 1fr;
@@ -234,13 +257,14 @@ class ProjectDrawer(Widget):
     def on_mount(self) -> None:
         self.query_one("#drawer-pin-btn", Button).can_focus = False
 
+    # ── Project list ──────────────────────────────────────────────────────────
+
     def refresh_projects(
         self,
         projects: list[str],
         current: str | None,
         open_paths: set[str],
     ) -> None:
-        """Rebuild the project list. Call whenever open projects change."""
         self._projects = projects
         self._current = current
         self._open_paths = open_paths
@@ -273,7 +297,7 @@ class ProjectDrawer(Widget):
     # ── Visibility ────────────────────────────────────────────────────────────
 
     def open(self) -> None:
-        """Show the drawer as a floating overlay."""
+        """Show as left-side overlay."""
         self.add_class("-open")
         self._focus_list()
 
@@ -282,7 +306,6 @@ class ProjectDrawer(Widget):
         self.remove_class("-open")
 
     def toggle(self) -> None:
-        """Toggle overlay visibility."""
         if self.has_class("-open"):
             self.close()
         else:
@@ -291,7 +314,7 @@ class ProjectDrawer(Widget):
     # ── Dock ──────────────────────────────────────────────────────────────────
 
     def _request_dock(self) -> None:
-        """Pin the drawer: close it and emit DockToggled(docked=True)."""
+        """Close drawer and ask app to show the tab bar instead."""
         self.close()
         self.post_message(DockToggled(docked=True))
 
@@ -329,13 +352,13 @@ class ProjectDrawer(Widget):
             self.close()
             event.stop()
         elif event.key == "p":
-            # 'p' only fires here when the drawer (or a child) has focus —
-            # never bleeds into the terminal pane which is a sibling widget.
+            # Only fires when the drawer (or a child) has focus — never the terminal.
             self._request_dock()
             event.stop()
         elif event.key == "enter":
             lst = self.query_one("#project-list", ListView)
-            if lst == self.focused or (self.focused and lst in self.focused.ancestors):
+            # Only handle Enter if the list view is the focused widget
+            if self.app.focused == lst or (self.app.focused and lst in self.app.focused.ancestors):
                 if lst.index is not None and lst.index < len(self._projects):
                     self._select_project(self._projects[lst.index])
                     event.stop()
