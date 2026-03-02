@@ -13,7 +13,7 @@ from unittest.mock import MagicMock
 
 from textual.widgets import Input
 
-from super_worker.app import SuperWorkerApp, WorktreeTabContent
+from super_worker.app import SuperWorkerApp
 from super_worker.screens import (
     CommitMessageScreen,
     ConfigScreen,
@@ -23,6 +23,7 @@ from super_worker.screens import (
     RenameSessionScreen,
 )
 from super_worker.models import Worktree
+from super_worker.widgets.project_view import WorktreeTabContent
 from super_worker.widgets.sidebar import SessionDeleted
 from super_worker.widgets.terminal_pane import TerminalPane
 
@@ -52,13 +53,20 @@ def isolate_externals(tmp_path, monkeypatch):
     monkeypatch.setattr("super_worker.services.tmux.libtmux.Server", lambda: mock_server)
 
 
+def _pv(app: SuperWorkerApp):
+    """Shorthand: get the active ProjectView."""
+    return app._active_project_view
+
+
 @pytest.mark.asyncio
 async def test_app_starts():
     """App starts without import errors or initialization crashes."""
     app = SuperWorkerApp()
     async with app.run_test() as pilot:
         assert app.is_running
-        assert len(app._state.worktrees) >= 1
+        pv = _pv(app)
+        assert pv is not None
+        assert len(pv._state.worktrees) >= 1
 
 
 @pytest.mark.asyncio
@@ -80,7 +88,8 @@ async def test_new_worktree_creates_tab(monkeypatch):
     """Submitting NewWorktreeScreen creates a worktree and adds a tab."""
     app = SuperWorkerApp()
     async with app.run_test() as pilot:
-        wt_dir = app._config.base_dir / f"{app._config.worktree_prefix}-test-feat"
+        pv = _pv(app)
+        wt_dir = pv._config.base_dir / f"{pv._config.worktree_prefix}-test-feat"
 
         def fake_worktree_cmd(*args):
             if args[0] == "add":
@@ -91,7 +100,7 @@ async def test_new_worktree_creates_tab(monkeypatch):
         mock_repo.git.worktree.side_effect = fake_worktree_cmd
         monkeypatch.setattr(gitpython, "Repo", lambda *a, **kw: mock_repo)
 
-        initial_count = len(app._state.worktrees)
+        initial_count = len(pv._state.worktrees)
 
         await pilot.press("ctrl+n")
         await pilot.pause()
@@ -99,9 +108,9 @@ async def test_new_worktree_creates_tab(monkeypatch):
         await pilot.press("enter")
         await pilot.pause(delay=2.0)
 
-        assert len(app._state.worktrees) == initial_count + 1
-        assert app._active_worktree is not None
-        assert app._active_worktree.name == "test-feat"
+        assert len(pv._state.worktrees) == initial_count + 1
+        assert pv._active_worktree is not None
+        assert pv._active_worktree.name == "test-feat"
 
         if wt_dir.exists():
             shutil.rmtree(wt_dir)
@@ -112,8 +121,9 @@ async def test_new_session_creates_and_selects():
     """Creating a session adds it, activates it, and selects it in sidebar."""
     app = SuperWorkerApp()
     async with app.run_test() as pilot:
-        wt = app._state.worktrees[0]
-        app._active_worktree = wt
+        pv = _pv(app)
+        wt = pv._state.worktrees[0]
+        pv._active_worktree = wt
         initial_count = len(wt.sessions)
 
         await pilot.press("ctrl+s")
@@ -124,10 +134,10 @@ async def test_new_session_creates_and_selects():
         await pilot.pause(delay=2.0)
 
         assert len(wt.sessions) == initial_count + 1
-        assert app._active_session_name == wt.sessions[-1].tmux_session_name
+        assert pv._active_session_name == wt.sessions[-1].tmux_session_name
 
         # Terminal shows the new session
-        wtc = app.query_one(f"#wtc-{wt.name}", WorktreeTabContent)
+        wtc = pv.query_one(f"#wtc-{wt.name}", WorktreeTabContent)
         terminal = wtc.query_one(TerminalPane)
         assert terminal.active_session == wt.sessions[-1].tmux_session_name
 
@@ -137,8 +147,9 @@ async def test_new_session_cancel():
     """Escape dismisses NewSessionScreen without creating a session."""
     app = SuperWorkerApp()
     async with app.run_test() as pilot:
-        wt = app._state.worktrees[0]
-        app._active_worktree = wt
+        pv = _pv(app)
+        wt = pv._state.worktrees[0]
+        pv._active_worktree = wt
         initial_sessions = len(wt.sessions)
 
         await pilot.press("ctrl+s")
@@ -156,10 +167,11 @@ async def test_rename_session():
     """Ctrl+R opens RenameSessionScreen and renaming updates the label."""
     app = SuperWorkerApp()
     async with app.run_test() as pilot:
-        wt = app._state.worktrees[0]
+        pv = _pv(app)
+        wt = pv._state.worktrees[0]
         session = wt.sessions[0]
-        app._active_worktree = wt
-        app._active_session_name = session.tmux_session_name
+        pv._active_worktree = wt
+        pv._active_session_name = session.tmux_session_name
 
         await pilot.press("ctrl+r")
         await pilot.pause()
@@ -177,7 +189,7 @@ async def test_delete_main_worktree_blocked():
     """Cannot delete the main worktree."""
     app = SuperWorkerApp()
     async with app.run_test() as pilot:
-        app._active_worktree = app._state.worktrees[0]
+        _pv(app)._active_worktree = _pv(app)._state.worktrees[0]
         await pilot.press("ctrl+d")
         await pilot.pause()
         assert not isinstance(app.screen, ConfirmDeleteScreen)
@@ -188,9 +200,10 @@ async def test_delete_worktree_opens_confirm():
     """Ctrl+D opens ConfirmDeleteScreen for non-main worktrees."""
     app = SuperWorkerApp()
     async with app.run_test() as pilot:
-        wt = Worktree(name="feature", path=str(app._config.repo_root), branch="sw-feature")
-        app._state.worktrees.append(wt)
-        app._active_worktree = wt
+        pv = _pv(app)
+        wt = Worktree(name="feature", path=str(pv._config.repo_root), branch="sw-feature")
+        pv._state.worktrees.append(wt)
+        pv._active_worktree = wt
 
         await pilot.press("ctrl+d")
         await pilot.pause()
@@ -202,22 +215,23 @@ async def test_delete_only_session_clears_terminal():
     """Deleting the sole session removes it from state and clears the terminal."""
     app = SuperWorkerApp()
     async with app.run_test() as pilot:
-        wt = app._state.worktrees[0]
+        pv = _pv(app)
+        wt = pv._state.worktrees[0]
         session = wt.sessions[0]
-        app._active_worktree = wt
-        app._active_session_name = session.tmux_session_name
+        pv._active_worktree = wt
+        pv._active_session_name = session.tmux_session_name
 
-        wtc = app.query_one(f"#wtc-{wt.name}", WorktreeTabContent)
+        wtc = pv.query_one(f"#wtc-{wt.name}", WorktreeTabContent)
         terminal = wtc.query_one(TerminalPane)
         terminal.active_session = session.tmux_session_name
         await pilot.pause()
 
-        app.post_message(SessionDeleted(wt, session))
+        pv.post_message(SessionDeleted(wt, session))
         await pilot.pause(delay=1.0)
 
         assert len(wt.sessions) == 0
         assert terminal.active_session is None
-        assert app._active_session_name is None
+        assert pv._active_session_name is None
 
 
 @pytest.mark.asyncio
@@ -225,8 +239,9 @@ async def test_delete_session_auto_selects_another():
     """Deleting a session when others remain auto-selects the first remaining session."""
     app = SuperWorkerApp()
     async with app.run_test() as pilot:
-        wt = app._state.worktrees[0]
-        app._active_worktree = wt
+        pv = _pv(app)
+        wt = pv._state.worktrees[0]
+        pv._active_worktree = wt
 
         # Create a second session
         await pilot.press("ctrl+s")
@@ -238,16 +253,16 @@ async def test_delete_session_auto_selects_another():
         first_session = wt.sessions[0]
         second_session = wt.sessions[1]
 
-        wtc = app.query_one(f"#wtc-{wt.name}", WorktreeTabContent)
+        wtc = pv.query_one(f"#wtc-{wt.name}", WorktreeTabContent)
         terminal = wtc.query_one(TerminalPane)
         terminal.active_session = first_session.tmux_session_name
-        app._active_session_name = first_session.tmux_session_name
+        pv._active_session_name = first_session.tmux_session_name
 
-        app.post_message(SessionDeleted(wt, first_session))
+        pv.post_message(SessionDeleted(wt, first_session))
         await pilot.pause(delay=1.0)
 
         assert len(wt.sessions) == 1
-        assert app._active_session_name == second_session.tmux_session_name
+        assert pv._active_session_name == second_session.tmux_session_name
         assert terminal.active_session == second_session.tmux_session_name
 
 
@@ -256,8 +271,9 @@ async def test_commit_dialog_opens():
     """Git commit action opens the CommitMessageScreen."""
     app = SuperWorkerApp()
     async with app.run_test() as pilot:
-        wt = app._state.worktrees[0]
-        app._git_commit(wt)
+        pv = _pv(app)
+        wt = pv._state.worktrees[0]
+        pv._git_commit(wt)
         await pilot.pause()
         assert isinstance(app.screen, CommitMessageScreen)
 
@@ -281,9 +297,10 @@ async def test_no_active_session_does_not_crash(key, active_wt, active_session, 
     """Actions requiring an active session warn gracefully."""
     app = SuperWorkerApp()
     async with app.run_test() as pilot:
+        pv = _pv(app)
         if not active_wt:
-            app._active_worktree = None
-        app._active_session_name = None
+            pv._active_worktree = None
+        pv._active_session_name = None
         await pilot.press(key)
         await pilot.pause()
         if screen_type:

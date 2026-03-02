@@ -30,6 +30,17 @@ def _check_prerequisites() -> None:
         sys.exit(1)
 
 
+def _require_git_repo() -> None:
+    """Exit with a clear message if not inside a git repository."""
+    from super_worker.config import detect_repo_root
+    try:
+        detect_repo_root()
+    except RuntimeError as e:
+        click.echo(f"Error: {e}", err=True)
+        click.echo("Tip: run 'sw' without a subcommand from any directory to open the TUI.", err=True)
+        sys.exit(1)
+
+
 @click.group(invoke_without_command=True)
 @click.pass_context
 def cli(ctx: click.Context) -> None:
@@ -51,6 +62,7 @@ def cli(ctx: click.Context) -> None:
 @click.option("--skip-permissions", "-s", is_flag=True, help="Launch Claude Code with --dangerously-skip-permissions")
 def new(name: str, branch: str | None, prompt: str | None, skip_permissions: bool) -> None:
     """Create a new worktree and optionally launch a Claude Code session."""
+    _require_git_repo()
     config = load_config()
     state = load_state(config)
     update_projects_registry(config)
@@ -89,6 +101,7 @@ def new(name: str, branch: str | None, prompt: str | None, skip_permissions: boo
 @click.option("--skip-permissions", "-s", is_flag=True, help="Launch Claude Code with --dangerously-skip-permissions")
 def add_session(worktree_name: str, prompt: str | None, label: str | None, skip_permissions: bool) -> None:
     """Add a new CC session to an existing worktree."""
+    _require_git_repo()
     config = load_config()
     state = load_state(config)
     wt = state.get_worktree(worktree_name)
@@ -105,6 +118,7 @@ def add_session(worktree_name: str, prompt: str | None, label: str | None, skip_
 @cli.command("list")
 def list_cmd() -> None:
     """List all worktrees and their sessions."""
+    _require_git_repo()
     config = load_config()
     state = load_state(config)
     if not state.worktrees:
@@ -130,6 +144,7 @@ def list_cmd() -> None:
 @click.option("--force", "-f", is_flag=True, help="Force remove even with uncommitted changes")
 def cleanup(name: str, force: bool) -> None:
     """Kill all sessions and remove a worktree."""
+    _require_git_repo()
     config = load_config()
     state = load_state(config)
     wt = state.get_worktree(name)
@@ -161,6 +176,7 @@ def config(key: str | None, value: str | None) -> None:
     With KEY: show a specific value.
     With KEY VALUE: set a value (e.g. `sw config worktree.branch_prefix sc-`).
     """
+    _require_git_repo()
     resolved = load_config()
     project_cfg = load_toml(resolved.repo_root / ".sw.toml")
 
