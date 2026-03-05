@@ -3,12 +3,11 @@
 from pathlib import Path
 
 from textual.app import ComposeResult
-from textual.containers import Vertical
-from textual.events import Key
+from textual.containers import Horizontal, Vertical
+from textual.events import Click, Key
 from textual.message import Message
 from textual.widget import Widget
 from textual.widgets import Button, Input, Label, ListItem, ListView, Static
-from textual.containers import Horizontal
 
 
 # ── Messages ─────────────────────────────────────────────────────────────────
@@ -34,6 +33,54 @@ class DockToggled(Message):
         super().__init__()
 
 
+class ProjectRemoved(Message):
+    """Fired when the user removes a project from the registry."""
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        super().__init__()
+
+
+# ── _ProjectTab ───────────────────────────────────────────────────────────────
+
+
+class _TabClose(Static):
+    """The × remove button on a project tab."""
+
+    def __init__(self, path: str) -> None:
+        super().__init__("×", classes="tab-close")
+        self._project_path = path
+
+    def on_click(self, event: Click) -> None:
+        event.stop()
+        self.post_message(ProjectRemoved(self._project_path))
+
+
+class _ProjectTab(Horizontal):
+    """A clickable project tab with a × remove button.
+
+    Horizontal container so name + × sit side-by-side at height:1.
+    """
+
+    def __init__(self, name: str, path: str, active: bool = False, loaded: bool = False) -> None:
+        classes = "proj-tab"
+        if active:
+            classes += " -active"
+        elif not loaded:
+            classes += " -unloaded"
+        super().__init__(classes=classes)
+        self._project_path = path
+        self._tab_name = name
+
+    def compose(self) -> ComposeResult:
+        yield Static(self._tab_name, classes="tab-name")
+        yield _TabClose(self._project_path)
+
+    def on_click(self, event: Click) -> None:
+        # _TabClose stops its own click; this fires for name-area clicks.
+        self.post_message(ProjectSelected(self._project_path))
+
+
 # ── ProjectTabBar ─────────────────────────────────────────────────────────────
 
 
@@ -52,7 +99,6 @@ class ProjectTabBar(Widget):
         height: 1;
         display: none;
         background: $panel;
-        border-bottom: solid $accent;
         layout: horizontal;
     }
     ProjectTabBar.-visible {
@@ -60,11 +106,13 @@ class ProjectTabBar(Widget):
     }
     .proj-tab {
         height: 1;
-        padding: 0 2;
-        border: none;
+        width: auto;
+        padding: 0 0 0 2;
         background: $panel;
+        color: $text;
+    }
+    .proj-tab.-unloaded {
         color: $text-muted;
-        min-width: 4;
     }
     .proj-tab:hover {
         background: $accent 15%;
@@ -74,6 +122,20 @@ class ProjectTabBar(Widget):
         background: $accent 25%;
         color: $text;
         text-style: bold;
+    }
+    .tab-name {
+        height: 1;
+        width: auto;
+        padding: 0 1 0 0;
+    }
+    .tab-close {
+        height: 1;
+        width: 2;
+        color: $text-muted;
+        padding: 0;
+    }
+    .tab-close:hover {
+        color: $error;
     }
     #tab-open-btn {
         height: 1;
@@ -101,7 +163,8 @@ class ProjectTabBar(Widget):
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
-        self._open_paths: list[str] = []
+        self._all_projects: list[str] = []
+        self._open_paths: set[str] = set()
         self._current: str | None = None
 
     def compose(self) -> ComposeResult:
@@ -118,31 +181,46 @@ class ProjectTabBar(Widget):
 
     def show(self) -> None:
         self.add_class("-visible")
+        self._rebuild_tabs()
 
     def hide(self) -> None:
         self.remove_class("-visible")
 
     # ── Project list ──────────────────────────────────────────────────────────
 
-    def refresh_projects(self, open_paths: set[str], current: str | None) -> None:
-        self._open_paths = list(open_paths)
+    def refresh_projects(
+        self,
+        all_projects: list[str],
+        open_paths: set[str],
+        current: str | None,
+    ) -> None:
+        self._all_projects = all_projects
+        self._open_paths = open_paths
         self._current = current
-        self.call_after_refresh(self._rebuild_tabs)
+        if self.has_class("-visible"):
+            self._rebuild_tabs()
 
     def _rebuild_tabs(self) -> None:
-        # Remove existing project tabs, keep the static buttons.
-        for btn in list(self.query(".proj-tab")):
-            btn.remove()
+        try:
+            add_btn = self.query_one("#tab-open-btn", Button)
+        except Exception:
+            return  # widget not yet mounted
 
-        add_btn = self.query_one("#tab-open-btn", Button)
-        for path in self._open_paths:
-            name = Path(path).name
-            is_active = path == self._current
-            btn = Button(name, classes="proj-tab" + (" -active" if is_active else ""))
-            btn._project_path = path  # type: ignore[attr-defined]
-            btn.can_focus = False
-            # Insert before "+ Open" so order is: [proj tabs] [+ Open] [📍]
-            self.mount(btn, before=add_btn)
+        # Remove all existing project tabs in one batch, mount new ones.
+        for tab in list(self.query(".proj-tab")):
+            tab.remove()
+
+        new_tabs = [
+            _ProjectTab(
+                Path(path).name,
+                path,
+                active=path == self._current,
+                loaded=path in self._open_paths,
+            )
+            for path in self._all_projects
+        ]
+        if new_tabs:
+            self.mount(*new_tabs, before=add_btn)
 
     # ── Events ────────────────────────────────────────────────────────────────
 
@@ -249,7 +327,7 @@ class ProjectDrawer(Widget):
             yield Static("Projects", id="drawer-title")
             yield Button("📌", id="drawer-pin-btn", tooltip="Dock above worktree tabs")
         yield ListView(id="project-list")
-        yield Static("↑↓ navigate  Enter: open  p: dock", id="drawer-hint")
+        yield Static("↑↓ ↵:open  Del:remove  p:dock  Esc", id="drawer-hint")
         with Vertical(id="drawer-input-area"):
             yield Label("Open path:", id="drawer-input-label")
             yield Input(placeholder="/path/to/repo", id="drawer-input")
@@ -361,4 +439,11 @@ class ProjectDrawer(Widget):
             if self.app.focused == lst or (self.app.focused and lst in self.app.focused.ancestors):
                 if lst.index is not None and lst.index < len(self._projects):
                     self._select_project(self._projects[lst.index])
+                    event.stop()
+        elif event.key == "delete":
+            lst = self.query_one("#project-list", ListView)
+            if self.app.focused == lst or (self.app.focused and lst in self.app.focused.ancestors):
+                if lst.index is not None and lst.index < len(self._projects):
+                    path = self._projects[lst.index]
+                    self.post_message(ProjectRemoved(path))
                     event.stop()

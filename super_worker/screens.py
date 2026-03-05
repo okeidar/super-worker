@@ -87,7 +87,8 @@ class NewWorktreeScreen(_ModalNavMixin, ModalScreen[tuple[str, str | None, str |
     }
     #new-wt-dialog {
         width: 60;
-        height: 22;
+        height: auto;
+        max-height: 80%;
         border: thick $accent;
         background: $surface;
         padding: 1 2;
@@ -146,7 +147,8 @@ class NewSessionScreen(_ModalNavMixin, ModalScreen[tuple[str, str | None, str | 
     }
     #new-sess-dialog {
         width: 60;
-        height: 20;
+        height: auto;
+        max-height: 80%;
         border: thick $accent;
         background: $surface;
         padding: 1 2;

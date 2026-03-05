@@ -67,7 +67,16 @@ class ResolvedConfig(BaseModel):
 def detect_repo_root(cwd: Path | str | None = None) -> Path:
     try:
         repo = gitpython.Repo(cwd or ".", search_parent_directories=True)
-        return Path(repo.working_dir)
+        # For linked worktrees, git-common-dir points to the main repo's .git/.
+        # For the main repo itself it returns ".git" (relative).
+        try:
+            common_dir = repo.git.rev_parse("--git-common-dir")
+            common_path = Path(common_dir)
+            if not common_path.is_absolute():
+                common_path = Path(repo.working_dir) / common_path
+            return common_path.parent
+        except Exception:
+            return Path(repo.working_dir)
     except gitpython.InvalidGitRepositoryError:
         raise RuntimeError("Not inside a git repository")
 

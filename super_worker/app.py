@@ -14,12 +14,14 @@ from super_worker.services.state import (
     load_state,
     reconcile_state,
     recover_dead_sessions,
+    remove_from_projects_registry,
     save_state,
     update_projects_registry,
 )
 from super_worker.widgets.project_drawer import (
     DockToggled,
     ProjectDrawer,
+    ProjectRemoved,
     ProjectSelected,
     ProjectTabBar,
 )
@@ -58,6 +60,8 @@ class SuperWorkerApp(App):
         Binding("ctrl+r", "rename_session", "Rename Session"),
         Binding("ctrl+d", "delete_worktree", "Delete Worktree"),
         Binding("ctrl+o", "toggle_project_drawer", "Projects"),
+        Binding("ctrl+shift+left", "prev_project", "Prev Project", key_display="ctrl+⇧◀"),
+        Binding("ctrl+shift+right", "next_project", "Next Project", key_display="ctrl+⇧▶"),
         Binding("ctrl+e", "edit_settings", "Settings"),
         Binding("ctrl+q", "quit", "Quit"),
     ]
@@ -114,6 +118,7 @@ class SuperWorkerApp(App):
             self.call_after_refresh(lambda: self.query_one(ProjectDrawer).open())
 
         self._refresh_drawer()
+        self.query_one(ProjectTabBar).show()
         self.set_interval(SIDEBAR_REFRESH_S, self._periodic_refresh)
 
     # ── Periodic refresh ──────────────────────────────────────────────────────
@@ -134,7 +139,9 @@ class SuperWorkerApp(App):
         open_paths = {str(cfg.repo_root) for cfg in self._open_configs}
         try:
             self.query_one(ProjectDrawer).refresh_projects(projects, current=current, open_paths=open_paths)
-            self.query_one(ProjectTabBar).refresh_projects(open_paths=open_paths, current=current)
+            self.query_one(ProjectTabBar).refresh_projects(
+                all_projects=projects, open_paths=open_paths, current=current
+            )
         except Exception:
             pass
 
@@ -153,6 +160,7 @@ class SuperWorkerApp(App):
         if event.docked:
             drawer.close()
             tab_bar.show()
+            self._refresh_drawer()
         else:
             tab_bar.hide()
             drawer.open()
@@ -162,6 +170,25 @@ class SuperWorkerApp(App):
             await self._open_or_switch_project(event.path)
 
         self.run_worker(_open, exclusive=False)
+
+    def on_project_removed(self, event: ProjectRemoved) -> None:
+        remove_from_projects_registry(event.path)
+        # If it was open, close it
+        self._open_configs = [c for c in self._open_configs if str(c.repo_root) != event.path]
+        # If it was active, switch to another open project or show placeholder
+        if self._active_project_view and str(self._active_project_view.config.repo_root) == event.path:
+            if self._open_configs:
+                cfg = self._open_configs[-1]
+
+                async def _reactivate():
+                    await self._activate_project(cfg)
+
+                self.run_worker(_reactivate, exclusive=False)
+            else:
+                self._active_project_view = None
+                self.sub_title = ""
+        self._refresh_drawer()
+        self.notify(f"Removed: {Path(event.path).name}")
 
     async def _open_or_switch_project(self, path: str) -> None:
         """Switch to an already-open project or load a new one."""
@@ -252,3 +279,25 @@ class SuperWorkerApp(App):
     def action_delete_worktree(self) -> None:
         if pv := self._active_project_view:
             pv.do_delete_worktree()
+
+    def action_prev_project(self) -> None:
+        self._cycle_project(-1)
+
+    def action_next_project(self) -> None:
+        self._cycle_project(1)
+
+    def _cycle_project(self, direction: int) -> None:
+        projects = load_projects_registry()
+        if not projects:
+            return
+        current = str(self._active_project_view.config.repo_root) if self._active_project_view else None
+        if current and current in projects:
+            idx = (projects.index(current) + direction) % len(projects)
+        else:
+            idx = 0
+        path = projects[idx]
+
+        async def _switch():
+            await self._open_or_switch_project(path)
+
+        self.run_worker(_switch, exclusive=False)

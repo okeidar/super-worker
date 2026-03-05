@@ -3,7 +3,7 @@ import json
 import logging
 from pathlib import Path
 
-from super_worker.config import ResolvedConfig
+from super_worker.config import ResolvedConfig, detect_repo_root
 from super_worker.constants import STATE_DIR
 from super_worker.models import AppState
 from super_worker.services.tmux import create_session, is_session_alive
@@ -151,6 +151,22 @@ def reconcile_state(state: AppState, config: ResolvedConfig | None = None) -> bo
     return changed
 
 
+def _normalize_registry(projects: list[str]) -> list[str]:
+    """Resolve any worktree paths to their main repo root and deduplicate."""
+    seen: list[str] = []
+    for p in projects:
+        path = Path(p)
+        if not path.exists():
+            continue
+        try:
+            normalized = str(detect_repo_root(path))
+        except RuntimeError:
+            continue
+        if normalized not in seen:
+            seen.append(normalized)
+    return seen
+
+
 def update_projects_registry(config: ResolvedConfig) -> None:
     """Track this repo in the global projects registry."""
     _ensure_state_dir()
@@ -165,10 +181,32 @@ def update_projects_registry(config: ResolvedConfig) -> None:
                     projects = json.loads(registry_path.read_text())
                 except (json.JSONDecodeError, TypeError):
                     projects = []
+            # Normalize: resolve worktrees → main repo, drop missing paths.
+            projects = _normalize_registry(projects)
             repo_str = str(config.repo_root)
             if repo_str not in projects:
                 projects.append(repo_str)
-                registry_path.write_text(json.dumps(projects, indent=2))
+            registry_path.write_text(json.dumps(projects, indent=2))
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
+
+
+def remove_from_projects_registry(path: str) -> None:
+    """Remove a repo path from the global projects registry."""
+    _ensure_state_dir()
+    registry_path = STATE_DIR / "projects.json"
+    lock_file = registry_path.with_suffix(".lock")
+    with open(lock_file, "a") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            projects: list[str] = []
+            if registry_path.exists():
+                try:
+                    projects = json.loads(registry_path.read_text())
+                except (json.JSONDecodeError, TypeError):
+                    projects = []
+            projects = [p for p in projects if p != path]
+            registry_path.write_text(json.dumps(projects, indent=2))
         finally:
             fcntl.flock(lf, fcntl.LOCK_UN)
 

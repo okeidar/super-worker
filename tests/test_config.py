@@ -50,9 +50,25 @@ class TestDetectRepoRoot:
     def test_success(self, monkeypatch):
         mock_repo = MagicMock()
         mock_repo.working_dir = "/home/user/myrepo"
+        mock_repo.git.rev_parse.return_value = ".git"  # normal repo: relative path
         monkeypatch.setattr(gitpython, "Repo", lambda *a, **kw: mock_repo)
         result = detect_repo_root()
         assert result == Path("/home/user/myrepo")
+
+    def test_worktree_resolves_to_main_repo(self, monkeypatch, tmp_path):
+        main_repo = tmp_path / "main"
+        main_repo.mkdir()
+        (main_repo / ".git").mkdir()
+        worktree = tmp_path / "wt-branch"
+        worktree.mkdir()
+
+        mock_repo = MagicMock()
+        mock_repo.working_dir = str(worktree)
+        # Worktree: --git-common-dir returns absolute path to main .git
+        mock_repo.git.rev_parse.return_value = str(main_repo / ".git")
+        monkeypatch.setattr(gitpython, "Repo", lambda *a, **kw: mock_repo)
+        result = detect_repo_root()
+        assert result == main_repo
 
     def test_not_a_repo(self, monkeypatch):
         monkeypatch.setattr(
@@ -259,6 +275,7 @@ class TestLoadConfig:
         origin.name = "origin"
         mock_repo.remotes = [origin]
         mock_repo.git.symbolic_ref.return_value = "refs/remotes/origin/main"
+        mock_repo.git.rev_parse.return_value = ".git"
 
         monkeypatch.setattr(gitpython, "Repo", lambda *a, **kw: mock_repo)
         cfg = load_config(str(repo_root))
@@ -279,6 +296,7 @@ class TestLoadConfig:
         origin.name = "origin"
         mock_repo.remotes = [origin]
         mock_repo.git.symbolic_ref.return_value = "refs/remotes/origin/main"
+        mock_repo.git.rev_parse.return_value = ".git"
 
         monkeypatch.setattr(gitpython, "Repo", lambda *a, **kw: mock_repo)
         cfg = load_config(str(repo_root))
