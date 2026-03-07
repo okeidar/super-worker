@@ -8,4 +8,4 @@ SIDEBAR_REFRESH_S = 5
 
 DEFAULT_WORKTREE_NAME = "main"
 
-RESERVED_KEYS = {"ctrl+n", "ctrl+s", "ctrl+a", "ctrl+t", "ctrl+r", "ctrl+d", "ctrl+e", "ctrl+q", "ctrl+o", "tab"}
+RESERVED_KEYS = {"ctrl+n", "ctrl+s", "ctrl+a", "ctrl+t", "ctrl+r", "ctrl+d", "ctrl+e", "ctrl+q", "ctrl+o", "ctrl+shift+left", "ctrl+shift+right", "tab"}
