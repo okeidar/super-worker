@@ -363,15 +363,16 @@ class SuperWorkerApp(App):
             return
         wt = self._active_worktree
 
-        def handle_result(result: tuple[str | None, str | None, bool] | None) -> None:
+        def handle_result(result: tuple[str, str | None, str | None, bool] | None) -> None:
             if result is None:
                 return
-            prompt, label, skip_perms = result
+            session_type, prompt, label, skip_perms = result
 
             async def _create_session() -> None:
                 try:
                     session = await asyncio.to_thread(
-                        create_session, wt, prompt=prompt, label=label, skip_permissions=skip_perms,
+                        create_session, wt, prompt=prompt, label=label,
+                        skip_permissions=skip_perms, session_type=session_type,
                     )
                     wt.sessions.append(session)
                     await asyncio.to_thread(save_state, self._state, self._config)

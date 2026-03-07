@@ -6,33 +6,54 @@ import re
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
+from textual.events import Key
 from textual.screen import ModalScreen
-from textual.widgets import Button, Checkbox, Input, Label
+from textual.widget import Widget
+from textual.widgets import Button, Checkbox, Input, Label, RadioButton, RadioSet
 
 from super_worker.config import ResolvedConfig, SWConfig, WorktreeConfig, EnvConfig, GitConfig, UIConfig, load_toml
 
 
-class ModalCheckbox(Checkbox):
-    """Checkbox that only toggles on space, not enter.
+def _dispatch_screen_enter(widget: Widget) -> bool:
+    """Find and run the screen's Enter binding action. Returns True if dispatched."""
+    for binding in widget.screen.BINDINGS:
+        if binding.key == "enter":
+            widget.call_later(widget.screen.run_action, binding.action)
+            return True
+    return False
 
-    In modals, enter should submit the form, not toggle a checkbox.
-    Space toggles the value. Enter is passed through to the screen.
-    """
+
+class _ModalToggleMixin:
+    """Mixin for toggle widgets in modals: Enter submits the form, Space toggles."""
 
     _last_key: str = ""
 
-    def on_key(self, event) -> None:
+    def on_key(self, event: Key) -> None:
         self._last_key = event.key
 
     def action_toggle_button(self) -> None:
         if self._last_key == "enter":
-            # Don't toggle — find and run the screen's enter binding action
-            for binding in self.screen.BINDINGS:
-                if "enter" in binding.key:
-                    self.call_later(self.screen.run_action, binding.action)
-                    return
+            _dispatch_screen_enter(self)
             return
         super().action_toggle_button()
+
+
+class ModalCheckbox(_ModalToggleMixin, Checkbox):
+    """Checkbox that submits the form on Enter instead of toggling."""
+
+
+class ModalRadioButton(_ModalToggleMixin, RadioButton):
+    """RadioButton that submits the form on Enter instead of toggling."""
+
+
+class ModalRadioSet(RadioSet):
+    """RadioSet that submits the form on Enter instead of selecting."""
+
+    def on_key(self, event: Key) -> None:
+        if event.key == "enter":
+            if _dispatch_screen_enter(self):
+                event.prevent_default()
+                event.stop()
 
 
 _NAV_BINDINGS = [
@@ -110,7 +131,7 @@ class NewWorktreeScreen(_ModalNavMixin, ModalScreen[tuple[str, str | None, str |
         self.dismiss(None)
 
 
-class NewSessionScreen(_ModalNavMixin, ModalScreen[tuple[str | None, str | None, bool] | None]):
+class NewSessionScreen(_ModalNavMixin, ModalScreen[tuple[str, str | None, str | None, bool] | None]):
     """Modal dialog for adding a session to the current worktree."""
 
     BINDINGS = [
@@ -125,16 +146,24 @@ class NewSessionScreen(_ModalNavMixin, ModalScreen[tuple[str | None, str | None,
     }
     #new-sess-dialog {
         width: 60;
-        height: 16;
+        height: 20;
         border: thick $accent;
         background: $surface;
         padding: 1 2;
+    }
+    #sess-type-set {
+        height: auto;
+        margin: 0 0 1 0;
     }
     """
 
     def compose(self) -> ComposeResult:
         with Vertical(id="new-sess-dialog"):
             yield Label("New Session")
+            yield Label("Type:")
+            with ModalRadioSet(id="sess-type-set"):
+                yield ModalRadioButton("Claude Code", value=True, id="sess-type-claude")
+                yield ModalRadioButton("Terminal", id="sess-type-terminal")
             yield Label("Prompt (optional, e.g. /plan):")
             yield Input(placeholder="/execute", id="sess-prompt")
             yield Label("Label (optional):")
@@ -142,14 +171,26 @@ class NewSessionScreen(_ModalNavMixin, ModalScreen[tuple[str | None, str | None,
             yield ModalCheckbox("Skip permissions", id="sess-skip-perms")
             yield Label("Press Enter to create, Escape to cancel")
 
+    def on_radio_set_changed(self, event: RadioSet.Changed) -> None:
+        is_terminal = event.index == 1
+        self.query_one("#sess-prompt", Input).disabled = is_terminal
+        self.query_one("#sess-skip-perms", Checkbox).disabled = is_terminal
+
     def on_input_submitted(self, event: Input.Submitted) -> None:
         self.action_submit()
 
     def action_submit(self) -> None:
-        prompt = self.query_one("#sess-prompt", Input).value.strip() or None
+        radio_set = self.query_one("#sess-type-set", RadioSet)
+        idx = radio_set.pressed_index
+        session_type = "terminal" if idx == 1 else "claude"
+        if session_type == "terminal":
+            prompt = None
+            skip_perms = False
+        else:
+            prompt = self.query_one("#sess-prompt", Input).value.strip() or None
+            skip_perms = self.query_one("#sess-skip-perms", Checkbox).value
         label = self.query_one("#sess-label", Input).value.strip() or None
-        skip_perms = self.query_one("#sess-skip-perms", Checkbox).value
-        self.dismiss((prompt, label, skip_perms))
+        self.dismiss((session_type, prompt, label, skip_perms))
 
     def action_cancel(self) -> None:
         self.dismiss(None)

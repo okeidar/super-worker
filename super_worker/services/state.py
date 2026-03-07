@@ -101,21 +101,27 @@ def recover_dead_sessions(state: AppState) -> bool:
         if not Path(wt.path).exists():
             continue
         alive = []
-        dead = []
+        dead_claude = []
+        dead_other = []
         for s in wt.sessions:
             if is_session_alive(s.tmux_session_name):
                 alive.append(s)
+            elif s.session_type == "claude":
+                dead_claude.append(s)
             else:
-                dead.append(s)
-        if not dead:
+                dead_other.append(s)
+        if not dead_claude and not dead_other:
             continue
-        # Replace all dead sessions with a single resumed session
         logger.info(
             "Recovering dead sessions in worktree",
-            extra={"worktree": wt.name, "dead_count": len(dead), "alive_count": len(alive)},
+            extra={"worktree": wt.name, "dead_claude": len(dead_claude), "dead_other": len(dead_other), "alive": len(alive)},
         )
-        resumed = create_session(wt, label="(resumed)", skip_permissions=False, resume=True)
-        wt.sessions = alive + [resumed]
+        # Resume dead claude sessions; drop dead terminal sessions (nothing to resume)
+        new_sessions = list(alive)
+        if dead_claude:
+            resumed = create_session(wt, label="(resumed)", skip_permissions=False, resume=True)
+            new_sessions.append(resumed)
+        wt.sessions = new_sessions
         changed = True
     return changed
 

@@ -133,6 +133,19 @@ class TestCreateSession:
         cmd = server.new_session.call_args[1]["window_command"]
         assert "--continue" in cmd
 
+    def test_creates_terminal_session(self, monkeypatch):
+        server = self._mock_server(monkeypatch)
+        monkeypatch.setenv("SHELL", "/bin/zsh")
+        wt = Worktree(name="feat", path="/tmp/feat", branch="main")
+
+        session = create_session(wt, session_type="terminal")
+
+        assert session.session_type == "terminal"
+        assert session.label == "terminal"
+        cmd = server.new_session.call_args[1]["window_command"]
+        assert "claude" not in cmd
+        assert "/bin/zsh" in cmd
+
     def test_avoids_name_collision(self, monkeypatch):
         existing = MagicMock()
         existing.session_name = "sw-feat-0"
