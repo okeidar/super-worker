@@ -217,6 +217,30 @@ class ProjectView(Widget):
         except Exception:
             pass
 
+    def pause_watching(self) -> None:
+        """Pause terminal capture when this project becomes inactive.
+
+        The kqueue state-file watchers keep running so attention indicators
+        (bell icon) still update for background projects.
+        """
+        if not self._active_worktree:
+            return
+        try:
+            wtc = self.query_one(f"#wtc-{self._active_worktree.name}", WorktreeTabContent)
+            wtc.query_one(TerminalPane).pause_watching()
+        except Exception:
+            pass
+
+    def resume_watching(self) -> None:
+        """Resume terminal capture when this project becomes active again."""
+        if not self._active_worktree:
+            return
+        try:
+            wtc = self.query_one(f"#wtc-{self._active_worktree.name}", WorktreeTabContent)
+            wtc.query_one(TerminalPane).resume_watching()
+        except Exception:
+            pass
+
     def _set_active_worktree(self, wt: Worktree) -> None:
         # Pause the old worktree's terminal captures (keeps content + state watches)
         old_wt = self._active_worktree

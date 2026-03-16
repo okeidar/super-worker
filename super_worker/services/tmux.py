@@ -35,6 +35,10 @@ def _get_pane(session_name: str) -> libtmux.Pane | None:
         ts, pane = _pane_cache[session_name]
         if now - ts < _PANE_CACHE_TTL:
             return pane
+        # TTL expired — sweep all stale entries at once so sessions that die
+        # unexpectedly (crash, external kill) don't linger in the cache forever.
+        for k in [k for k, (t, _) in _pane_cache.items() if now - t >= _PANE_CACHE_TTL]:
+            del _pane_cache[k]
 
     server = _get_server()
     try:

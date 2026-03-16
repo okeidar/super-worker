@@ -66,9 +66,13 @@ def state_dir(tmp_path, monkeypatch):
 
 class TestThreading:
     def test_kqueue_executor_max_workers_is_one(self):
-        """The module-level _KQUEUE_EXECUTOR must be limited to exactly 1 worker."""
-        from super_worker.services.pane_watcher import _KQUEUE_EXECUTOR
-        assert _KQUEUE_EXECUTOR._max_workers == 1
+        """Each PaneWatcher's per-instance executor must be limited to 1 worker."""
+        from super_worker.services.pane_watcher import PaneWatcher
+        w = PaneWatcher()
+        try:
+            assert w._executor._max_workers == 1
+        finally:
+            w.cleanup()
 
     @pytest.mark.asyncio
     async def test_only_one_kqueue_thread_after_trigger(self, watcher, state_dir, monkeypatch):

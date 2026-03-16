@@ -126,13 +126,19 @@ class SuperWorkerApp(App):
                 exclusive=True,
                 name="periodic-refresh",
             )
-        # Check states for non-active projects so attention indicators update
+        # Check states for non-active projects so attention indicators update.
+        # exclusive=True per project: if a previous check is still running when
+        # the next 5s tick fires, cancel it rather than letting workers pile up.
         for cfg in self._open_configs:
             pv_id = f"pv-{cfg.state_hash}"
             try:
                 pv = self.query_one(f"#{pv_id}", ProjectView)
                 if pv is not self._active_project_view:
-                    self.run_worker(pv.check_attention, exclusive=False)
+                    self.run_worker(
+                        pv.check_attention,
+                        exclusive=True,
+                        group=f"ca-{pv_id}",
+                    )
             except Exception:
                 pass
 
@@ -231,6 +237,10 @@ class SuperWorkerApp(App):
         except Exception:
             pass
 
+        # Pause the outgoing project before mounting the new one
+        if self._active_project_view:
+            self._active_project_view.pause_watching()
+
         await switcher.mount(pv)
         switcher.current = pv_id
         self._active_project_view = pv
@@ -243,9 +253,16 @@ class SuperWorkerApp(App):
         """Switch focus to an already-mounted ProjectView."""
         pv_id = f"pv-{config.state_hash}"
         try:
+            # Pause the outgoing project's capture timer before switching.
+            # The kqueue state-file watchers are not paused — they keep running
+            # so background projects still update their attention indicators.
+            if self._active_project_view:
+                self._active_project_view.pause_watching()
+
             switcher = self.query_one("#project-switcher", ContentSwitcher)
             switcher.current = pv_id
             self._active_project_view = self.query_one(f"#{pv_id}", ProjectView)
+            self._active_project_view.resume_watching()
             self.sub_title = str(config.repo_root)
             self._refresh_drawer()
         except Exception:

@@ -12,13 +12,6 @@ from typing import Callable
 
 logger = logging.getLogger(__name__)
 
-# One dedicated thread for the blocking kqueue call.
-# Isolated from asyncio's default pool so it never starves capture/send-keys workers.
-_KQUEUE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
-    max_workers=1,
-    thread_name_prefix="sw-kqueue",
-)
-
 
 @dataclass
 class _Watch:
@@ -31,8 +24,10 @@ class _Watch:
 class PaneWatcher:
     """Watches session state files via kqueue for state change notifications.
 
-    One asyncio task blocks on kq.control() in a dedicated 1-thread executor.
-    Callbacks are invoked directly from the asyncio task on the event loop.
+    Each instance owns a dedicated 1-thread executor for its blocking kqueue
+    call. A shared global executor caused N PaneWatchers to serialize on a
+    single thread (each blocking for up to 0.5 s), making state-event latency
+    grow as N × 0.5 s with multiple open projects.
     """
 
     def __init__(self) -> None:
@@ -40,7 +35,9 @@ class PaneWatcher:
         self._lock = threading.Lock()
         self._fd_to_watch: dict[int, _Watch] = {}
         self._state_watches: dict[str, _Watch] = {}
-
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="sw-kqueue"
+        )
         self._running = True
         self._task: asyncio.Task | None = None
 
@@ -87,6 +84,7 @@ class PaneWatcher:
             self._kq.close()
         except Exception:
             pass
+        self._executor.shutdown(wait=False)
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
@@ -142,7 +140,7 @@ class PaneWatcher:
             while self._running:
                 try:
                     events = await loop.run_in_executor(
-                        _KQUEUE_EXECUTOR, self._kq.control, None, 32, 0.5
+                        self._executor, self._kq.control, None, 32, 0.5
                     )
                 except Exception:
                     if self._running:

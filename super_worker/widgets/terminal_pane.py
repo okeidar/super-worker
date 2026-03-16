@@ -118,7 +118,6 @@ class TerminalPane(Widget, can_focus=True):
             return
         if self._fallback_timer is not None:
             return  # Already running
-        self._last_hash = _NO_HASH  # Force re-render on resume
         self._poll_pane()
         self._fallback_timer = self.set_interval(PANE_FALLBACK_POLL_S, self._poll_pane)
 
