@@ -362,7 +362,8 @@ class TestTerminalPaneResume:
     def test_resume_watching_no_pipe_pane_calls(self):
         """resume_watching must not call start_watching (pipe-pane removed)."""
         import ast
-        src = Path("/Users/omerkeidar/Projects/super-worker/super_worker/widgets/terminal_pane.py").read_text()
+        import super_worker.widgets.terminal_pane as terminal_pane_mod
+        src = Path(terminal_pane_mod.__file__).read_text()
         tree = ast.parse(src)
 
         for node in ast.walk(tree):

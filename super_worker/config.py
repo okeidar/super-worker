@@ -5,11 +5,14 @@ merges them, and fills missing values via git auto-detection.
 """
 
 import hashlib
+import logging
 import tomllib
 from pathlib import Path
 
 import git as gitpython
 from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
 
 
 class WorktreeConfig(BaseModel):
@@ -96,6 +99,12 @@ def detect_main_branch(remote: str, cwd: Path | str | None = None) -> str:
     try:
         repo = gitpython.Repo(cwd or ".", search_parent_directories=True)
         ref = repo.git.symbolic_ref(f"refs/remotes/{remote}/HEAD")
+        # Strip the "refs/remotes/<remote>/" prefix, keeping the FULL branch
+        # name — split("/")[-1] truncated "release/2.0" to "2.0", breaking
+        # ahead/behind and pull for slashed default branches.
+        prefix = f"refs/remotes/{remote}/"
+        if ref.startswith(prefix):
+            return ref[len(prefix):]
         return ref.split("/")[-1]
     except gitpython.GitCommandError:
         pass
@@ -152,9 +161,15 @@ def _escape_toml_str(s: str) -> str:
 def load_toml(path: Path) -> SWConfig:
     if not path.exists():
         return SWConfig()
-    with open(path, "rb") as f:
-        data = tomllib.load(f)
-    return SWConfig.model_validate(data)
+    try:
+        with open(path, "rb") as f:
+            data = tomllib.load(f)
+        return SWConfig.model_validate(data)
+    except Exception:
+        # A malformed .sw.toml must not brick startup — fall back to
+        # defaults and tell the user which file is broken.
+        logger.warning("Invalid config at %s — using defaults", path, exc_info=True)
+        return SWConfig()
 
 
 def _merge_configs(project: SWConfig, global_: SWConfig) -> SWConfig:
@@ -200,7 +215,15 @@ def load_config(repo_path: Path | str | None = None) -> ResolvedConfig:
         repo_root=repo_root,
         worktree_prefix=merged.worktree.prefix or repo_name,
         branch_prefix=branch_prefix,
-        base_dir=Path(merged.worktree.base_dir) if merged.worktree.base_dir else repo_root.parent,
+        # Anchor a relative base_dir to the repo root — resolving against the
+        # process cwd scattered worktrees depending on where sw was launched
+        # (tmux popups and status commands run from arbitrary directories).
+        base_dir=(
+            repo_root / merged.worktree.base_dir
+            if merged.worktree.base_dir and not Path(merged.worktree.base_dir).is_absolute()
+            else Path(merged.worktree.base_dir) if merged.worktree.base_dir
+            else repo_root.parent
+        ),
         symlinks=merged.env.symlinks or [".venv", ".claude"],
         copies=merged.env.copies or [],
         post_create_hook=merged.env.post_create_hook,

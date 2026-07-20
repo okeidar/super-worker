@@ -9,12 +9,14 @@ import subprocess
 from pathlib import Path
 
 from super_worker.config import load_config
-from super_worker.constants import DEFAULT_WORKTREE_NAME
+from super_worker.constants import DEFAULT_WORKTREE_NAME, format_pane_title
 from super_worker.services.fast_ui import (
     add_pane_to_window,
     create_worktree_window,
     find_window_for_worktree,
     make_fast_session,
+    resolve_target,
+    resolve_window_ref,
     worktree_name_from_window,
 )
 from super_worker.services.state import load_state, remove_worktree_from_state, save_state
@@ -22,13 +24,28 @@ from super_worker.services.tmux import _get_server
 from super_worker.services.worktree import BranchExistsError, create_worktree, remove_worktree
 
 
-def _load_worktree_for_window(window_name: str):
-    """Load config, state, and worktree for a window name.
+def _resolve_host(host_ref: str) -> str:
+    """Resolve a --session id ($N) or legacy session name to the host name."""
+    info = resolve_target(host_ref) if host_ref.startswith("$") else None
+    return info["session_name"] if info else host_ref
+
+
+def _load_worktree_for_window(window_ref: str):
+    """Load config, state, and worktree for a window reference (@id or name).
+
+    The project is located from the window's pane cwd when available, so the
+    wizard works regardless of the popup's working directory (tmux popups do
+    not run in the project directory).
 
     Returns (config, state, worktree) or prints error and returns None.
     """
-    wt_name = worktree_name_from_window(window_name)
-    config = load_config()
+    wt_name, ctx_path = resolve_window_ref(window_ref)
+    try:
+        config = load_config(Path(ctx_path)) if ctx_path else load_config()
+    except RuntimeError as e:
+        print(f"  {e}")
+        input("  Press Enter to close...")
+        return None
     state = load_state(config)
     wt = state.get_worktree(wt_name)
     if not wt:
@@ -46,6 +63,7 @@ def _wizard_header(title: str) -> None:
 
 def wizard_new_worktree(host_session: str) -> None:
     """Interactive prompt for creating a new worktree."""
+    host_session = _resolve_host(host_session)
     _wizard_header("New Worktree")
 
     name = input("  Name: ").strip()
@@ -54,7 +72,14 @@ def wizard_new_worktree(host_session: str) -> None:
         input("  Press Enter to close...")
         return
 
-    config = load_config()
+    # Locate the project from the host session's pane cwd, not the popup cwd.
+    info = resolve_target(host_session)
+    try:
+        config = load_config(Path(info["pane_path"])) if info else load_config()
+    except RuntimeError as e:
+        print(f"  {e}")
+        input("  Press Enter to close...")
+        return
     branch_default = f"{config.branch_prefix}{name}"
     branch = input(f"  Branch ({branch_default}): ").strip() or None
     prompt = input("  Prompt (optional): ").strip() or None
@@ -76,10 +101,15 @@ def wizard_new_worktree(host_session: str) -> None:
         use = input(f"  Branch '{e.branch}' exists. Use it? [Y/n]: ").strip().lower()
         if use == "n":
             return
-        wt = create_worktree(
-            config, name, branch=branch, use_existing_branch=True,
-            detach=detach, worktree_index=len(state.worktrees),
-        )
+        try:
+            wt = create_worktree(
+                config, name, branch=branch, use_existing_branch=True,
+                detach=detach, worktree_index=len(state.worktrees),
+            )
+        except Exception as e:  # noqa: F841 — retry failed; show it, don't traceback
+            print(f"  Error: {e}")
+            input("  Press Enter to close...")
+            return
     except Exception as e:
         print(f"  Error: {e}")
         input("  Press Enter to close...")
@@ -101,8 +131,14 @@ def wizard_new_worktree(host_session: str) -> None:
     print(f"  Created worktree: {name}")
 
 
-def wizard_new_session(host_session: str, window_name: str) -> None:
+def wizard_new_session(host_session: str, window_ref: str) -> None:
     """Interactive prompt for adding a session to the current worktree window."""
+    # New bindings pass only --window @id; derive the host session from it.
+    if window_ref.startswith("@"):
+        info = resolve_target(window_ref)
+        if info:
+            host_session = info["session_name"]
+
     _wizard_header("New Session")
 
     type_input = input("  Type [1=Claude, 2=Terminal] (1): ").strip()
@@ -116,7 +152,7 @@ def wizard_new_session(host_session: str, window_name: str) -> None:
 
     label = input("  Label (optional): ").strip() or None
 
-    result = _load_worktree_for_window(window_name)
+    result = _load_worktree_for_window(window_ref)
     if not result:
         return
     config, state, wt = result
@@ -144,16 +180,59 @@ def wizard_new_session(host_session: str, window_name: str) -> None:
     print(f"  Created session: {session.label}")
 
 
-def wizard_delete_worktree(host_session: str, window_name: str) -> None:
+def wizard_rename_session(pane_ref: str) -> None:
+    """Prompt for a new label and rename the session owning this pane.
+
+    Replaces the old tmux command-prompt flow, which interpolated raw user
+    input into a shell string (an apostrophe broke it; worse was possible).
+    """
+    info = resolve_target(pane_ref)
+    if not info:
+        print("  Pane not found.")
+        input("  Press Enter to close...")
+        return
+
+    _wizard_header("Rename Session")
+    label = input("  New label: ").strip()
+    if not label:
+        return
+
+    try:
+        config = load_config(Path(info["pane_path"]))
+    except RuntimeError as e:
+        print(f"  {e}")
+        input("  Press Enter to close...")
+        return
+    state = load_state(config)
+    match = state.find_session_by_pane_id(info["pane_id"])
+    if not match:
+        print("  Session not found in state.")
+        input("  Press Enter to close...")
+        return
+    _, session = match
+    session.label = label
+    save_state(state, config)
+    _get_server().cmd(
+        "select-pane", "-t", info["pane_id"],
+        "-T", format_pane_title(label, session.session_type),
+    )
+    print(f"  Renamed to: {label}")
+
+
+def wizard_delete_worktree(host_session: str, window_ref: str) -> None:
     """Confirm and delete a worktree, optionally deleting the branch."""
-    wt_name = worktree_name_from_window(window_name)
+    wt_name, _ = resolve_window_ref(window_ref)
+    if window_ref.startswith("@"):
+        info = resolve_target(window_ref)
+        if info:
+            host_session = info["session_name"]
 
     if wt_name == DEFAULT_WORKTREE_NAME:
         print("  Cannot delete the main worktree.")
         input("  Press Enter to close...")
         return
 
-    result = _load_worktree_for_window(window_name)
+    result = _load_worktree_for_window(window_ref)
     if not result:
         return
     config, state, wt = result
@@ -194,14 +273,15 @@ def wizard_delete_worktree(host_session: str, window_name: str) -> None:
     save_state(state, config)
     print(f"  Deleted worktree: {wt_name}")
     if del_branch:
-        print(f"  Deleted branch: {wt.branch}")
+        # Branch deletion failures are logged, not raised — don't claim success.
+        print(f"  Requested deletion of branch: {wt.branch}")
 
 
-def wizard_git_commit(window_name: str) -> None:
+def wizard_git_commit(window_ref: str) -> None:
     """Prompt for commit message and commit."""
     from super_worker.services.worktree import git_commit
 
-    result = _load_worktree_for_window(window_name)
+    result = _load_worktree_for_window(window_ref)
     if not result:
         return
     config, state, wt = result
@@ -214,7 +294,8 @@ def wizard_git_commit(window_name: str) -> None:
         input("  Press Enter to close...")
         return
 
-    err = git_commit(wt.path, msg)
+    exclude = list(config.copies) + list(config.symlinks)
+    err = git_commit(wt.path, msg, exclude)
     print(f"  Commit failed: {err}" if err else "  Committed.")
     input("  Press Enter to close...")
 

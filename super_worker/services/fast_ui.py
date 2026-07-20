@@ -48,6 +48,66 @@ def find_window_for_worktree(
 
 
 # ---------------------------------------------------------------------------
+# Target resolution — bound tmux commands pass only IDs (%pane/@window/$session)
+# ---------------------------------------------------------------------------
+
+def resolve_target(target: str) -> dict | None:
+    """Resolve a tmux id to its context (session/window/pane names + cwd).
+
+    Menu keybindings pass ONLY tmux ids: they match ``^[%@$][0-9]+$`` so they
+    are shell-safe by construction. Names (which may contain quotes, ``$``,
+    backticks — git allows all of these in branch names) are resolved here in
+    Python and never travel through a shell string.
+    """
+    server = _get_server()
+    try:
+        result = server.cmd(
+            "display-message", "-p", "-t", target,
+            "-F", "#{session_name}\t#{window_id}\t#{window_name}\t#{pane_id}\t#{pane_current_path}",
+        )
+        stdout = getattr(result, "stdout", None) or []
+        parts = (stdout[0] if stdout else "").split("\t")
+        if len(parts) == 5:
+            return {
+                "session_name": parts[0],
+                "window_id": parts[1],
+                "window_name": parts[2],
+                "pane_id": parts[3],
+                "pane_path": parts[4],
+            }
+    except Exception:
+        logger.debug("Failed to resolve tmux target %s", target, exc_info=True)
+    return None
+
+
+def _is_tmux_id(ref: str) -> bool:
+    return bool(ref) and ref[0] in "%@$" and ref[1:].isdigit()
+
+
+def resolve_window_ref(window_ref: str) -> tuple[str, str | None]:
+    """Resolve a window reference (id or legacy name) to (worktree_name, cwd).
+
+    Accepts both ``@N`` ids (current bindings) and raw window names (stale
+    bindings from a previous sw version still cached in a running tmux
+    server). cwd is the window's active pane path when known — used to locate
+    the right project regardless of the popup's working directory.
+    """
+    if _is_tmux_id(window_ref):
+        info = resolve_target(window_ref)
+        if info:
+            return worktree_name_from_window(info["window_name"]), info["pane_path"]
+        return "", None
+    return worktree_name_from_window(window_ref), None
+
+
+def find_window_by_id(host: "libtmux.Session", window_id: str) -> "libtmux.Window | None":
+    for w in host.windows:
+        if w.window_id == window_id:
+            return w
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Host session naming
 # ---------------------------------------------------------------------------
 
@@ -92,11 +152,13 @@ def _configure_host_session(session: libtmux.Session, config: ResolvedConfig) ->
     session.set_option("status-left-length", "40")
     session.set_option("status-left-style", "bold")
 
-    # Right side: periodic refresh + keybinding hint
-    sw = shutil.which("sw") or "sw"
+    # Right side: periodic refresh + keybinding hint.
+    # '#{session_id}' is single-quoted: #() content runs through a shell,
+    # where an unquoted $N would expand to an (empty) positional parameter.
+    sw = shlex.quote(shutil.which("sw") or "sw")
     session.set_option(
         "status-right",
-        f"#({sw} fast-refresh 2>/dev/null) Ctrl+B, Space: menu ",
+        f"#({sw} fast-refresh --session '#{{session_id}}' 2>/dev/null) Ctrl+B, Space: menu ",
     )
     session.set_option("status-right-length", "80")
 
@@ -115,11 +177,20 @@ def _configure_host_session(session: libtmux.Session, config: ResolvedConfig) ->
     session.set_option("remain-on-exit", "on")
 
     # --- Keybindings ---
-    # tmux format variables (#{window_name}, #{pane_id}) are expanded by tmux
-    # at bind-time, so we pass them as literal strings.
-    host = shlex.quote(session.session_name)
-    wn = "#{window_name}"  # tmux expands this at runtime
-    pid = "#{pane_id}"     # tmux expands this at runtime
+    # SECURITY: bound commands carry ONLY tmux ids (%pane/@window/$session,
+    # always [%@$]digits — shell-safe). Names are resolved in Python at
+    # invoke time. Interpolating #{window_name} here allowed shell injection:
+    # window names embed git branch names, and a branch like x'$(cmd)' is
+    # legal — picking any menu item would have executed it. The ids are
+    # single-quoted because run-shell/popup commands go through a shell,
+    # where a bare $N would expand as a positional parameter.
+    #
+    # Ids also fix cross-project misrouting: --host used to be baked in at
+    # bind time (bindings are server-global), so with two fast-mode projects
+    # the menu operated on whichever project configured last.
+    wid = "'#{window_id}'"
+    pid = "'#{pane_id}'"
+    sid = "'#{session_id}'"
 
     # ── Master menu on Ctrl+B, Space ──
     # One discoverable entry point — no conflicts with tmux defaults.
@@ -128,24 +199,24 @@ def _configure_host_session(session: libtmux.Session, config: ResolvedConfig) ->
         "bind-key", "-T", "prefix", "Space",
         "display-menu", "-T", "#[bold]Super Worker",
         # -- Worktrees --
-        "New worktree",       "w", f'display-popup -w 55 -h 14 -E "{sw} fast-wizard new-worktree --host {host}"',
-        "Delete worktree",    "d", f'display-popup -w 55 -h 14 -E "{sw} fast-wizard delete-worktree --host {host} --window \'{wn}\'"',
+        "New worktree",       "w", f'display-popup -w 55 -h 14 -E "{sw} fast-wizard new-worktree --session {sid}"',
+        "Delete worktree",    "d", f'display-popup -w 55 -h 14 -E "{sw} fast-wizard delete-worktree --window {wid}"',
         "",                   "",  "",
         # -- Sessions --
-        "New session (split)", "s", f'display-popup -w 55 -h 12 -E "{sw} fast-wizard new-session --host {host} --window \'{wn}\'"',
-        "Kill this pane",     "x", f'confirm-before -p "Kill this session?" "run-shell \\"{sw} fast-kill-pane --host {host} --pane \'{pid}\'\\"; kill-pane"',
-        "Rename session",     "r", f'command-prompt -p "Rename session:" "run-shell \\"{sw} fast-rename-pane --host {host} --pane \'{pid}\' --label \'%%\'\\""',
-        "Resume dead pane",   "c", f'if-shell -F "#{{pane_dead}}" "run-shell \\"{sw} fast-respawn-pane --host {host} --pane \'{pid}\' --window \'{wn}\'\\""  "display-message \\"Pane is still alive\\""',
+        "New session (split)", "s", f'display-popup -w 55 -h 12 -E "{sw} fast-wizard new-session --window {wid}"',
+        "Kill this pane",     "x", f'confirm-before -p "Kill this session?" "run-shell \\"{sw} fast-kill-pane --pane {pid}\\"; kill-pane"',
+        "Rename session",     "r", f'display-popup -w 55 -h 8 -E "{sw} fast-wizard rename-session --pane {pid}"',
+        "Resume dead pane",   "c", f'if-shell -F "#{{pane_dead}}" "run-shell \\"{sw} fast-respawn-pane --pane {pid}\\""  "display-message \\"Pane is still alive\\""',
         "",                   "",  "",
         # -- Git --
-        "Git: Commit",        "1", f'display-popup -w 60 -h 8 -E "{sw} fast-wizard git-commit --window \'{wn}\'"',
-        "Git: Push",          "2", f'display-popup -w 60 -h 6 -E "{sw} fast-git push --window \'{wn}\'"',
-        "Git: Pull",          "3", f'display-popup -w 60 -h 6 -E "{sw} fast-git pull --window \'{wn}\'"',
-        "Git: Open PR",       "4", f'display-popup -w 60 -h 6 -E "{sw} fast-git pr --window \'{wn}\'"',
+        "Git: Commit",        "1", f'display-popup -w 60 -h 8 -E "{sw} fast-wizard git-commit --window {wid}"',
+        "Git: Push",          "2", f'display-popup -w 60 -h 6 -E "{sw} fast-git push --window {wid}"',
+        "Git: Pull",          "3", f'display-popup -w 60 -h 6 -E "{sw} fast-git pull --window {wid}"',
+        "Git: Open PR",       "4", f'display-popup -w 60 -h 6 -E "{sw} fast-git pr --window {wid}"',
         "",                   "",  "",
         # -- Projects & settings --
         "Switch project",     "p", f'display-popup -w 60 -h 18 -E "{sw} fast-wizard switch-project"',
-        "Open in terminal",   "t", f'run-shell "{sw} fast-open-terminal --host {host}"',
+        "Open in terminal",   "t", f'run-shell "{sw} fast-open-terminal --session {sid}"',
         "Edit settings",      "e", f'display-popup -w 70 -h 20 -E "{sw} config"',
         "",                   "",  "",
         "Help",               "?", f'display-popup -w 55 -h 32 -E "{sw} fast-help"',
@@ -155,10 +226,10 @@ def _configure_host_session(session: libtmux.Session, config: ResolvedConfig) ->
     server.cmd(
         "bind-key", "-T", "prefix", "g",
         "display-menu", "-T", "#[bold]Git",
-        "Commit", "c", f'display-popup -w 60 -h 8 -E "{sw} fast-wizard git-commit --window \'{wn}\'"',
-        "Push",   "p", f'display-popup -w 60 -h 6 -E "{sw} fast-git push --window \'{wn}\'"',
-        "Pull",   "l", f'display-popup -w 60 -h 6 -E "{sw} fast-git pull --window \'{wn}\'"',
-        "Open PR","r", f'display-popup -w 60 -h 6 -E "{sw} fast-git pr --window \'{wn}\'"',
+        "Commit", "c", f'display-popup -w 60 -h 8 -E "{sw} fast-wizard git-commit --window {wid}"',
+        "Push",   "p", f'display-popup -w 60 -h 6 -E "{sw} fast-git push --window {wid}"',
+        "Pull",   "l", f'display-popup -w 60 -h 6 -E "{sw} fast-git pull --window {wid}"',
+        "Open PR","r", f'display-popup -w 60 -h 6 -E "{sw} fast-git pr --window {wid}"',
     )
 
 
@@ -325,6 +396,19 @@ def update_window_names(config: ResolvedConfig, state: AppState, host_name: str)
 # Launch entry point
 # ---------------------------------------------------------------------------
 
+def _attach_or_switch(name: str) -> None:
+    """Attach to the host session — or switch the current client to it.
+
+    Inside tmux ($TMUX set — e.g. the switch-project popup), a nested
+    ``tmux attach-session`` is refused by tmux; ``switch-client`` is the
+    correct verb and makes "Switch project" actually switch.
+    """
+    if os.environ.get("TMUX"):
+        _get_server().cmd("switch-client", "-t", name)
+        return
+    os.execvp("tmux", ["tmux", "attach-session", "-t", name])
+
+
 def launch(config: ResolvedConfig, state: AppState) -> None:
     """Main entry point for fast mode.
 
@@ -344,8 +428,8 @@ def launch(config: ResolvedConfig, state: AppState) -> None:
             len(windows) == 1 and windows[0].window_name != ""
         )
         if has_content:
-            os.execvp("tmux", ["tmux", "attach-session", "-t", name])
-            return  # unreachable after execvp
+            _attach_or_switch(name)
+            return
     except Exception:
         pass  # Session doesn't exist yet
 
@@ -403,5 +487,5 @@ def launch(config: ResolvedConfig, state: AppState) -> None:
         f"tmux set-hook -u -t {session_ref} client-attached'",
     )
 
-    # Replace process with tmux attach
-    os.execvp("tmux", ["tmux", "attach-session", "-t", name])
+    # Attach (or switch the current client when already inside tmux)
+    _attach_or_switch(name)

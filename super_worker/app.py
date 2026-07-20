@@ -54,7 +54,10 @@ class SuperWorkerApp(App):
         Binding("ctrl+s", "new_session", "New Session"),
         Binding("ctrl+a", "full_attach", "Full Attach"),
         Binding("ctrl+t", "open_terminal", "Open Terminal"),
-        Binding("ctrl+r", "rename_session", "Rename Session"),
+        # F2, not Ctrl+R: Ctrl+R is forwarded to Claude Code (transcript view —
+        # the only way to browse a CC session's history; CC never writes
+        # terminal scrollback).
+        Binding("f2", "rename_session", "Rename Session"),
         Binding("ctrl+d", "delete_worktree", "Delete Worktree"),
         Binding("ctrl+o", "toggle_project_drawer", "Projects"),
         Binding("ctrl+shift+left", "prev_project", "Prev Project", key_display="ctrl+⇧◀"),
@@ -69,6 +72,7 @@ class SuperWorkerApp(App):
         install_hooks()
         self._active_project_view: ProjectView | None = None
         self._open_configs: list[ResolvedConfig] = []
+        self._opening: set[str] = set()  # paths with an in-flight open worker
         self._initial_project: tuple[ResolvedConfig, object] | None = None
         self._attention_paths: set[str] = set()
 
@@ -88,16 +92,21 @@ class SuperWorkerApp(App):
         with Horizontal(id="main-area"):
             # Overlay mode: left-side drawer, hidden by default (Ctrl+O to toggle).
             yield ProjectDrawer(id="project-drawer")
-            initial_id = f"pv-{self._initial_project[0].state_hash}" if self._initial_project else None
+            # The placeholder is ALWAYS mounted: ContentSwitcher(initial=None)
+            # hides every child (so the message never showed), and removing
+            # the last open project needs something to switch back to.
+            initial_id = (
+                f"pv-{self._initial_project[0].state_hash}"
+                if self._initial_project else "no-project"
+            )
             with ContentSwitcher(id="project-switcher", initial=initial_id):
+                yield Static(
+                    "No project open.\nPress Ctrl+O to open a project.",
+                    id="no-project",
+                )
                 if self._initial_project:
                     config, state = self._initial_project
                     yield ProjectView(config, state, id=f"pv-{config.state_hash}")
-                else:
-                    yield Static(
-                        "No project open.\nPress Ctrl+O to open a project.",
-                        id="no-project",
-                    )
         yield Footer()
 
     def on_mount(self) -> None:
@@ -121,9 +130,14 @@ class SuperWorkerApp(App):
 
     def _periodic_refresh(self) -> None:
         if self._active_project_view:
+            # group= scopes exclusivity: without it, exclusive=True lands in
+            # the DEFAULT worker group and silently cancels unrelated workers
+            # on the App node — most damagingly the _open/_reactivate project
+            # loads, which then never complete and show no error.
             self.run_worker(
                 self._active_project_view.periodic_refresh,
                 exclusive=True,
+                group="periodic-refresh",
                 name="periodic-refresh",
             )
         # Check states for non-active projects so attention indicators update.
@@ -160,6 +174,27 @@ class SuperWorkerApp(App):
         except Exception:
             pass
 
+    async def action_quit(self) -> None:
+        """Quit, first releasing manual sizing on all known sessions.
+
+        The preview pins sessions to its widget size (window-size manual);
+        without this, a plain `tmux attach` after quitting shows a small
+        fixed-size window instead of filling the terminal.
+        """
+        from super_worker.services.tmux import set_window_size
+
+        def _release_all() -> None:
+            for pv in self.query(ProjectView):
+                for wt in pv.state.worktrees:
+                    for s in wt.sessions:
+                        set_window_size(s.tmux_session_name, "latest")
+
+        try:
+            await asyncio.to_thread(_release_all)
+        except Exception:
+            logger.debug("Failed to release manual window sizing on quit", exc_info=True)
+        await super().action_quit()
+
     def action_toggle_project_drawer(self) -> None:
         self.query_one(ProjectDrawer).toggle()
 
@@ -191,10 +226,23 @@ class SuperWorkerApp(App):
 
     def on_project_removed(self, event: ProjectRemoved) -> None:
         remove_from_projects_registry(event.path)
-        # If it was open, close it
+        removed = [c for c in self._open_configs if str(c.repo_root) == event.path]
         self._open_configs = [c for c in self._open_configs if str(c.repo_root) != event.path]
-        # If it was active, switch to another open project or show placeholder
-        if self._active_project_view and str(self._active_project_view.config.repo_root) == event.path:
+        was_active = bool(
+            self._active_project_view
+            and str(self._active_project_view.config.repo_root) == event.path
+        )
+        # Unmount the widget — leaving it mounted keeps its UI interactive
+        # behind the switcher and crashes with DuplicateIds if the project
+        # is ever reopened (same widget id would be mounted twice).
+        for cfg in removed:
+            try:
+                self.query_one(f"#pv-{cfg.state_hash}", ProjectView).remove()
+            except Exception:
+                logger.debug("ProjectView already gone for %s", event.path)
+        if was_active:
+            self._active_project_view = None
+            self.sub_title = ""
             if self._open_configs:
                 cfg = self._open_configs[-1]
 
@@ -203,8 +251,11 @@ class SuperWorkerApp(App):
 
                 self.run_worker(_reactivate, exclusive=False)
             else:
-                self._active_project_view = None
-                self.sub_title = ""
+                try:
+                    switcher = self.query_one("#project-switcher", ContentSwitcher)
+                    switcher.current = "no-project"
+                except Exception:
+                    logger.debug("Failed to show no-project placeholder", exc_info=True)
         self._refresh_drawer()
         self.notify(f"Removed: {Path(event.path).name}")
 
@@ -216,7 +267,17 @@ class SuperWorkerApp(App):
                 await self._activate_project(cfg)
                 return
 
-        # Load fresh
+        # In-flight guard: two rapid selections of the same project would
+        # both pass the check above and mount duplicate widget ids (crash).
+        if path in self._opening:
+            return
+        self._opening.add(path)
+        try:
+            await self._load_project(path)
+        finally:
+            self._opening.discard(path)
+
+    async def _load_project(self, path: str) -> None:
         try:
             new_config = await asyncio.to_thread(load_config, Path(path))
         except RuntimeError as e:
@@ -229,13 +290,6 @@ class SuperWorkerApp(App):
         pv = ProjectView(new_config, new_state, id=pv_id)
 
         switcher = self.query_one("#project-switcher", ContentSwitcher)
-
-        # Remove the "no project" placeholder if present
-        try:
-            no_project = self.query_one("#no-project", Static)
-            await no_project.remove()
-        except Exception:
-            pass
 
         # Pause the outgoing project before mounting the new one
         if self._active_project_view:
@@ -263,6 +317,9 @@ class SuperWorkerApp(App):
             switcher.current = pv_id
             self._active_project_view = self.query_one(f"#{pv_id}", ProjectView)
             self._active_project_view.resume_watching()
+            # Move focus off the outgoing (now hidden) project's terminal —
+            # otherwise keystrokes keep going to the invisible session.
+            self._active_project_view.focus_terminal()
             self.sub_title = str(config.repo_root)
             self._refresh_drawer()
         except Exception:

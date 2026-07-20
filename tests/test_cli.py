@@ -38,8 +38,16 @@ def mock_env(tmp_path, monkeypatch):
     wt.sessions.append(Session(tmux_session_name="sw-main-0", label="session 0"))
     state = AppState(repo_root=str(repo_root), worktree_base=str(base_dir), worktrees=[wt])
 
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _fake_mutate(*a, **kw):
+        # Mirror the real mutate_state: yield the in-memory state under "lock".
+        yield state
+
     monkeypatch.setattr("super_worker.cli.load_config", lambda *a, **kw: config)
     monkeypatch.setattr("super_worker.cli.load_state", lambda *a, **kw: state)
+    monkeypatch.setattr("super_worker.cli.mutate_state", _fake_mutate)
     monkeypatch.setattr("super_worker.cli.update_projects_registry", lambda *a, **kw: None)
     monkeypatch.setattr("super_worker.cli.save_state", lambda *a, **kw: None)
 

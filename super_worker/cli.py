@@ -4,8 +4,8 @@ import sys
 import click
 
 from super_worker.config import load_config, load_toml, save_project_config
-from super_worker.constants import format_pane_title
-from super_worker.services.state import load_state, remove_worktree_from_state, save_state, update_projects_registry
+from super_worker.constants import format_pane_title, is_valid_worktree_name
+from super_worker.services.state import load_state, mutate_state, remove_worktree_from_state, save_state, update_projects_registry
 from super_worker.services.tmux import create_session, is_session_alive, kill_all_sessions
 from super_worker.services.worktree import (
     BranchExistsError,
@@ -57,7 +57,7 @@ def cli(ctx: click.Context, fast: bool) -> None:
 
             install_hooks()
             config = load_config()
-            state = load_and_reconcile(config)
+            state = load_and_reconcile(config, ui_mode="fast")
             launch(config, state)
         else:
             # Lazy import: SuperWorkerApp pulls in Textual, which is slow to load.
@@ -76,19 +76,25 @@ def cli(ctx: click.Context, fast: bool) -> None:
 def new(name: str, branch: str | None, prompt: str | None, skip_permissions: bool) -> None:
     """Create a new worktree and optionally launch a Claude Code session."""
     _require_git_repo()
+    if not is_valid_worktree_name(name):
+        click.echo("Name must contain only letters, digits, hyphens, and underscores.", err=True)
+        raise SystemExit(1)
     config = load_config()
-    state = load_state(config)
     update_projects_registry(config)
-
-    if state.get_worktree(name):
+    existing = load_state(config)
+    if existing.get_worktree(name):  # cheap up-front check before slow git ops
         click.echo(f"Worktree '{name}' already exists.", err=True)
         raise SystemExit(1)
+    idx = len(existing.worktrees)  # hook hint only
 
+    # Create the worktree first (slow git + can prompt), OUTSIDE the state
+    # lock so we don't block other sw processes during git ops. Then commit
+    # the state change atomically so a concurrent `sw new` can't clobber it.
     try:
-        wt = create_worktree(config, name, branch, worktree_index=len(state.worktrees))
+        wt = create_worktree(config, name, branch, worktree_index=idx)
     except BranchExistsError as e:
         if click.confirm(f"Branch '{e.branch}' already exists. Use it?"):
-            wt = create_worktree(config, name, branch, use_existing_branch=True, worktree_index=len(state.worktrees))
+            wt = create_worktree(config, name, branch, use_existing_branch=True, worktree_index=idx)
         else:
             click.echo("Aborted.", err=True)
             raise SystemExit(1)
@@ -96,15 +102,20 @@ def new(name: str, branch: str | None, prompt: str | None, skip_permissions: boo
         click.echo(str(e), err=True)
         raise SystemExit(1)
 
-    state.worktrees.append(wt)
-    click.echo(f"Created worktree: {wt.path} (branch: {wt.branch})")
-
+    session = None
     if prompt or skip_permissions:
         session = create_session(wt, prompt=prompt, label=prompt, skip_permissions=skip_permissions)
         wt.sessions.append(session)
-        click.echo(f"Launched session: {session.tmux_session_name} ({session.label})")
 
-    save_state(state, config)
+    with mutate_state(config) as state:
+        if state.get_worktree(name):
+            click.echo(f"Worktree '{name}' already exists.", err=True)
+            raise SystemExit(1)
+        state.worktrees.append(wt)
+
+    click.echo(f"Created worktree: {wt.path} (branch: {wt.branch})")
+    if session is not None:
+        click.echo(f"Launched session: {session.tmux_session_name} ({session.label})")
 
 
 @cli.command("add")
@@ -116,16 +127,16 @@ def add_session(worktree_name: str, prompt: str | None, label: str | None, skip_
     """Add a new CC session to an existing worktree."""
     _require_git_repo()
     config = load_config()
-    state = load_state(config)
-    wt = state.get_worktree(worktree_name)
-    if not wt:
-        click.echo(f"Worktree '{worktree_name}' not found.", err=True)
-        raise SystemExit(1)
-
-    session = create_session(wt, prompt=prompt, label=label, skip_permissions=skip_permissions)
-    wt.sessions.append(session)
+    # Look up the worktree under the lock; create the tmux session; then
+    # append to the freshly-read worktree so a concurrent writer isn't lost.
+    with mutate_state(config) as state:
+        wt = state.get_worktree(worktree_name)
+        if not wt:
+            click.echo(f"Worktree '{worktree_name}' not found.", err=True)
+            raise SystemExit(1)
+        session = create_session(wt, prompt=prompt, label=label, skip_permissions=skip_permissions)
+        wt.sessions.append(session)
     click.echo(f"Launched session: {session.tmux_session_name} ({session.label})")
-    save_state(state, config)
 
 
 @cli.command("list")
@@ -169,14 +180,15 @@ def cleanup(name: str, force: bool) -> None:
     click.echo(f"Killed {len(wt.sessions)} session(s).")
 
     try:
-        remove_worktree(state, name, force=force)
+        remove_worktree(state, name, force=force)  # slow git ops, outside the lock
         click.echo(f"Removed worktree: {wt.path}")
     except RuntimeError as e:
         click.echo(str(e), err=True)
         raise SystemExit(1)
 
-    state = remove_worktree_from_state(state, name)
-    save_state(state, config)
+    # Commit the removal atomically against concurrent writers.
+    with mutate_state(config) as st:
+        remove_worktree_from_state(st, name)
 
 
 @cli.command()
@@ -247,40 +259,54 @@ def config(key: str | None, value: str | None) -> None:
 @cli.command("fast-wizard", hidden=True)
 @click.argument("action")
 @click.option("--host", "host_session", default="")
-@click.option("--window", "window_name", default="")
-def fast_wizard(action: str, host_session: str, window_name: str) -> None:
-    """Interactive wizards for fast mode (called by tmux popups)."""
+@click.option("--session", "session_ref", default="")
+@click.option("--window", "window_ref", default="")
+@click.option("--pane", "pane_ref", default="")
+def fast_wizard(action: str, host_session: str, session_ref: str, window_ref: str, pane_ref: str) -> None:
+    """Interactive wizards for fast mode (called by tmux popups).
+
+    Current bindings pass tmux ids (--session/--window/--pane); --host is
+    accepted for stale bindings cached in an already-running tmux server.
+    """
     from super_worker.services.fast_wizard import (
         wizard_delete_worktree,
         wizard_git_commit,
         wizard_new_session,
         wizard_new_worktree,
+        wizard_rename_session,
         wizard_switch_project,
     )
 
     if action == "new-worktree":
-        wizard_new_worktree(host_session)
+        wizard_new_worktree(session_ref or host_session)
     elif action == "new-session":
-        wizard_new_session(host_session, window_name)
+        wizard_new_session(host_session, window_ref)
     elif action == "delete-worktree":
-        wizard_delete_worktree(host_session, window_name)
+        wizard_delete_worktree(host_session, window_ref)
+    elif action == "rename-session":
+        wizard_rename_session(pane_ref)
     elif action == "git-commit":
-        wizard_git_commit(window_name)
+        wizard_git_commit(window_ref)
     elif action == "switch-project":
         wizard_switch_project()
 
 
 @cli.command("fast-git", hidden=True)
 @click.argument("action")
-@click.option("--window", "window_name", required=True)
-def fast_git(action: str, window_name: str) -> None:
-    """Git operations for fast mode (push/pull/pr)."""
-    _require_git_repo()
-    from super_worker.services.fast_ui import worktree_name_from_window
+@click.option("--window", "window_ref", required=True)
+def fast_git(action: str, window_ref: str) -> None:
+    """Git operations for fast mode (push/pull/pr). --window takes @id or name."""
+    from pathlib import Path
+
+    from super_worker.services.fast_ui import resolve_window_ref
     from super_worker.services.worktree import git_create_pr, git_pull, git_push
 
-    wt_name = worktree_name_from_window(window_name)
-    cfg = load_config()
+    wt_name, ctx_path = resolve_window_ref(window_ref)
+    try:
+        cfg = load_config(Path(ctx_path)) if ctx_path else load_config()
+    except RuntimeError as e:
+        click.echo(str(e), err=True)
+        raise SystemExit(1)
     state = load_state(cfg)
     wt = state.get_worktree(wt_name)
     if not wt:
@@ -303,14 +329,37 @@ def fast_git(action: str, window_name: str) -> None:
     input("  Press Enter to close...")
 
 
+def _project_for_pane(pane_ref: str):
+    """Resolve (config, state, pane_info) from a tmux pane id.
+
+    The pane's cwd is the worktree directory, which detect_repo_root resolves
+    to the main repo — this works no matter which directory the tmux server
+    or popup happens to run in (the old cwd-based lookup silently targeted
+    the wrong project, so 'killed' panes resurrected on next launch).
+    """
+    from pathlib import Path
+
+    from super_worker.services.fast_ui import resolve_target
+
+    info = resolve_target(pane_ref)
+    if not info:
+        return None
+    try:
+        cfg = load_config(Path(info["pane_path"]))
+    except RuntimeError:
+        return None
+    return cfg, load_state(cfg), info
+
+
 @cli.command("fast-kill-pane", hidden=True)
-@click.option("--host", "host_session", required=True)
+@click.option("--host", "host_session", default="")  # legacy bindings only
 @click.option("--pane", "pane_id", required=True)
 def fast_kill_pane(host_session: str, pane_id: str) -> None:
     """Remove a session from state when its pane is killed."""
-    _require_git_repo()
-    cfg = load_config()
-    state = load_state(cfg)
+    resolved = _project_for_pane(pane_id)
+    if resolved is None:
+        return
+    cfg, state, _ = resolved
     match = state.find_session_by_pane_id(pane_id)
     if match:
         wt, s = match
@@ -319,16 +368,18 @@ def fast_kill_pane(host_session: str, pane_id: str) -> None:
 
 
 @cli.command("fast-rename-pane", hidden=True)
-@click.option("--host", "host_session", required=True)
+@click.option("--host", "host_session", default="")  # legacy bindings only
 @click.option("--pane", "pane_id", required=True)
 @click.option("--label", required=True)
 def fast_rename_pane(host_session: str, pane_id: str, label: str) -> None:
-    """Rename a session and update its pane title."""
-    _require_git_repo()
+    """Rename a session and update its pane title (legacy path — the menu
+    now uses the rename-session wizard, which avoids tmux command-prompt)."""
     from super_worker.services.tmux import _get_server
 
-    cfg = load_config()
-    state = load_state(cfg)
+    resolved = _project_for_pane(pane_id)
+    if resolved is None:
+        return
+    cfg, state, _ = resolved
     match = state.find_session_by_pane_id(pane_id)
     if match:
         _, s = match
@@ -339,58 +390,76 @@ def fast_rename_pane(host_session: str, pane_id: str, label: str) -> None:
 
 
 @cli.command("fast-refresh", hidden=True)
-def fast_refresh() -> None:
-    """Refresh window names with git info (called by tmux status-interval)."""
-    try:
-        from super_worker.config import detect_repo_root
+@click.option("--session", "session_ref", default="")
+def fast_refresh(session_ref: str) -> None:
+    """Refresh window names with git info (called by tmux status-interval).
 
-        detect_repo_root()
+    Resolves the project from the host session's active pane cwd — #() status
+    commands run with the tmux SERVER's cwd, which is unrelated to the project
+    (the old cwd-based lookup silently never refreshed, or read another repo).
+    """
+    from pathlib import Path
+
+    from super_worker.services.fast_ui import resolve_target, update_window_names
+
+    ctx = None
+    if session_ref:
+        info = resolve_target(session_ref)
+        if info:
+            ctx = info
+    try:
+        cfg = load_config(Path(ctx["pane_path"])) if ctx else load_config()
     except RuntimeError:
         return
-    cfg = load_config()
     state = load_state(cfg)
-    from super_worker.services.fast_ui import host_session_name, update_window_names
+    from super_worker.services.fast_ui import host_session_name
 
-    update_window_names(cfg, state, host_session_name(cfg))
+    host = ctx["session_name"] if ctx else host_session_name(cfg)
+    update_window_names(cfg, state, host)
 
 
 @cli.command("fast-respawn-pane", hidden=True)
-@click.option("--host", "host_session", required=True)
+@click.option("--host", "host_session", default="")   # legacy bindings only
 @click.option("--pane", "pane_id", required=True)
-@click.option("--window", "window_name", required=True)
-def fast_respawn_pane(host_session: str, pane_id: str, window_name: str) -> None:
+@click.option("--window", "window_ref", default="")   # legacy bindings only
+def fast_respawn_pane(host_session: str, pane_id: str, window_ref: str) -> None:
     """Respawn a dead pane with claude --continue."""
-    _require_git_repo()
     from super_worker.services.fast_ui import build_pane_cmd, make_fast_session, worktree_name_from_window
     from super_worker.services.tmux import _get_server
 
-    cfg = load_config()
-    state = load_state(cfg)
+    resolved = _project_for_pane(pane_id)
     server = _get_server()
-
-    match = state.find_session_by_pane_id(pane_id)
-    if match:
-        wt, s = match
-        if s.session_type == "claude":
-            cmd = build_pane_cmd(s, wt, host_session, resume=True)
-            server.cmd("respawn-pane", "-k", "-t", pane_id, cmd)
-            return
+    if resolved is not None:
+        cfg, state, info = resolved
+        host = info["session_name"]
+        match = state.find_session_by_pane_id(pane_id)
+        if match:
+            wt, s = match
+            if s.session_type == "claude":
+                cmd = build_pane_cmd(s, wt, host, resume=True)
+                server.cmd("respawn-pane", "-k", "-t", pane_id, cmd)
+                return
+        window_name = info["window_name"]
+    else:
+        host = host_session
+        window_name = window_ref
 
     # Fallback: build a minimal resume command
     from super_worker.models import Worktree as WtModel
     wt_name = worktree_name_from_window(window_name)
-    fallback_session = make_fast_session(host_session, label="resumed")
+    fallback_session = make_fast_session(host, label="resumed")
     fallback_wt = WtModel(name=wt_name, path=".", branch="")
-    cmd = build_pane_cmd(fallback_session, fallback_wt, host_session, resume=True)
+    cmd = build_pane_cmd(fallback_session, fallback_wt, host, resume=True)
     server.cmd("respawn-pane", "-k", "-t", pane_id, cmd)
 
 
 @cli.command("fast-open-terminal", hidden=True)
-@click.option("--host", "host_session", required=True)
-def fast_open_terminal(host_session: str) -> None:
+@click.option("--host", "host_session", default="")     # legacy bindings
+@click.option("--session", "session_ref", default="")   # current bindings ($id)
+def fast_open_terminal(host_session: str, session_ref: str) -> None:
     """Open a new terminal emulator window attached to the host session."""
     from super_worker.services.tmux import open_external_terminal
-    open_external_terminal(host_session)
+    open_external_terminal(session_ref or host_session)
 
 
 @cli.command("fast-help", hidden=True)

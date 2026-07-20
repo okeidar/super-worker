@@ -164,7 +164,7 @@ async def test_new_session_cancel():
 
 @pytest.mark.asyncio
 async def test_rename_session():
-    """Ctrl+R opens RenameSessionScreen and renaming updates the label."""
+    """F2 opens RenameSessionScreen and renaming updates the label."""
     app = SuperWorkerApp()
     async with app.run_test() as pilot:
         pv = _pv(app)
@@ -173,7 +173,7 @@ async def test_rename_session():
         pv._active_worktree = wt
         pv._active_session_name = session.tmux_session_name
 
-        await pilot.press("ctrl+r")
+        await pilot.press("f2")
         await pilot.pause()
         assert isinstance(app.screen, RenameSessionScreen)
 
@@ -290,7 +290,7 @@ async def test_settings_modal_opens():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("key,active_wt,active_session,screen_type", [
-    ("ctrl+r", True, False, RenameSessionScreen),
+    ("f2", True, False, RenameSessionScreen),
     ("ctrl+a", False, False, None),
 ])
 async def test_no_active_session_does_not_crash(key, active_wt, active_session, screen_type):
@@ -305,3 +305,111 @@ async def test_no_active_session_does_not_crash(key, active_wt, active_session, 
         await pilot.pause()
         if screen_type:
             assert not isinstance(app.screen, screen_type)
+
+
+@pytest.mark.asyncio
+async def test_remove_active_project_unmounts_and_shows_placeholder():
+    """Removing the active project unmounts its view and shows the placeholder.
+
+    Regression: the ProjectView used to stay mounted (interactive behind the
+    switcher), and reopening the project crashed the app with DuplicateIds.
+    """
+    from textual.widgets import ContentSwitcher, Static
+    from super_worker.widgets.project_drawer import ProjectRemoved
+    from super_worker.widgets.project_view import ProjectView
+
+    app = SuperWorkerApp()
+    async with app.run_test() as pilot:
+        pv = _pv(app)
+        path = str(pv.config.repo_root)
+        pv_id = f"pv-{pv.config.state_hash}"
+        app._open_configs = [pv.config]
+
+        app.on_project_removed(ProjectRemoved(path))
+        await pilot.pause(delay=0.5)
+
+        assert not list(app.query(f"#{pv_id}")), "ProjectView must be unmounted"
+        assert app._active_project_view is None
+        switcher = app.query_one("#project-switcher", ContentSwitcher)
+        assert switcher.current == "no-project", "placeholder must be shown"
+        placeholder = app.query_one("#no-project", Static)
+        assert placeholder.display, "placeholder must be visible"
+
+
+@pytest.mark.asyncio
+async def test_placeholder_visible_without_initial_project(monkeypatch, tmp_path):
+    """With no project, the 'No project open' message actually renders.
+
+    Regression: ContentSwitcher(initial=None) hides ALL children, so the
+    placeholder text never displayed.
+    """
+    from textual.widgets import ContentSwitcher, Static
+    import super_worker.app as app_mod
+
+    def raise_no_repo(*a, **kw):
+        raise RuntimeError("not a git repo")
+
+    monkeypatch.setattr(app_mod, "load_config", raise_no_repo)
+    app = SuperWorkerApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        switcher = app.query_one("#project-switcher", ContentSwitcher)
+        assert switcher.current == "no-project"
+        assert app.query_one("#no-project", Static).display
+
+
+@pytest.mark.asyncio
+async def test_active_session_set_after_async_startup():
+    """The default session is created off __init__ (async) yet still adopted as active.
+
+    Regression: moving `create_session` out of ProjectView.__init__ (to avoid
+    a blocking tmux call on the event loop) must not leave Ctrl+A/Ctrl+S
+    without an active session right after open.
+    """
+    app = SuperWorkerApp()
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause(delay=1.0)
+        pv = _pv(app)
+        wt = pv._state.worktrees[0]
+        assert wt.sessions, "default worktree should have a lazily-created session"
+        assert pv._active_session_name == wt.sessions[0].tmux_session_name
+        wtc = pv.query_one(f"#wtc-{wt.name}", WorktreeTabContent)
+        assert wtc.query_one(TerminalPane).active_session == wt.sessions[0].tmux_session_name
+
+
+@pytest.mark.asyncio
+async def test_delete_gone_worktree_still_closes_tab(monkeypatch):
+    """A worktree deleted outside sw (git-removed) must still close its tab.
+
+    Regression: remove_worktree used to raise for an already-gone worktree and
+    the handler bailed, so the stale tab could never be closed.
+    """
+    import super_worker.widgets.project_view as pvmod
+
+    app = SuperWorkerApp()
+    async with app.run_test() as pilot:
+        pv = _pv(app)
+        wt = Worktree(name="feat", path="/nonexistent/gone-wt", branch="sw-feat")
+        pv._state.worktrees.append(wt)
+        await pv._add_worktree_tab(wt)
+        await pilot.pause()
+        pv._active_worktree = wt
+        assert list(pv.query("#wt-feat")), "tab should exist before delete"
+
+        # Simulate git cleanup failing exactly like an already-removed worktree.
+        def raise_gone(*a, **k):
+            raise RuntimeError("fatal: 'gone-wt' is not a working tree")
+        monkeypatch.setattr(pvmod, "remove_worktree", raise_gone)
+
+        # Auto-confirm the delete dialog (user presses Delete, keep branch).
+        def auto_confirm(screen, callback=None):
+            if callback:
+                callback(False)
+        monkeypatch.setattr(app, "push_screen", auto_confirm)
+
+        pv.do_delete_worktree()
+        await pilot.pause(delay=1.0)
+
+        assert pv._state.get_worktree("feat") is None, "worktree removed from state despite git error"
+        assert not list(pv.query("#wt-feat")), "tab closed despite git cleanup failing"
+        assert app.is_running

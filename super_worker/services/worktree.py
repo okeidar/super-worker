@@ -109,16 +109,19 @@ def _setup_env(repo: Path, wt_path: Path, config: ResolvedConfig) -> None:
         src = repo / link_name
         dst = wt_path / link_name
         if src.exists() and not dst.exists():
+            dst.parent.mkdir(parents=True, exist_ok=True)  # support nested paths (e.g. "a/b")
             dst.symlink_to(src)
             created_symlinks.append(link_name)
 
-    if created_symlinks:
-        _add_git_excludes(wt_path, created_symlinks)
+    # Exclude BOTH symlinks and copies from git so `git add -A` (used by the
+    # commit action) never stages a symlinked venv or a copied .env secret.
+    _add_git_excludes(wt_path, list(config.symlinks) + list(config.copies))
 
     for copy_name in config.copies:
         src = repo / copy_name
         dst = wt_path / copy_name
         if src.exists():
+            dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(str(src), str(dst))
 
 
@@ -126,8 +129,11 @@ def _run_post_create_hook(hook: str, wt_path: Path, index: int) -> None:
     """Run post-create hook script if configured."""
     if not hook:
         return
+    # Compare resolved-to-resolved: on macOS the worktree base often sits
+    # under a symlinked component (/tmp → /private/tmp), and comparing a
+    # resolved hook path against an unresolved root silently skipped the hook.
     hook_path = (wt_path / hook).resolve()
-    if not hook_path.is_relative_to(wt_path):
+    if not hook_path.is_relative_to(wt_path.resolve()):
         logger.warning("Post-create hook escapes worktree directory", extra={"hook": hook, "resolved": str(hook_path)})
         return
     if not hook_path.exists():
@@ -191,24 +197,54 @@ def remove_worktree(
     git_repo = gitpython.Repo(repo)
     branch = wt.branch
 
+    # Never operate on the main working tree. The default "main" worktree's
+    # path IS the repo root; git refuses to `worktree remove` it, and with
+    # force=True the manual-cleanup fallback below would rmtree the whole repo.
     try:
-        args = ["remove"]
-        if force:
-            args.append("--force")
-        args.append(str(wt_path))
-        git_repo.git.worktree(*args)
-    except gitpython.GitCommandError as e:
-        stderr = str(e.stderr or e)
-        if not force and "contains modified or untracked files" in stderr:
-            raise RuntimeError(
-                f"Worktree has uncommitted changes. Use --force to remove anyway.\n{stderr}"
-            ) from e
-        if not force:
-            raise RuntimeError(f"Failed to remove worktree: {stderr}") from e
-        # force=True: git failed, clean up directory manually
-        if wt_path.exists():
-            shutil.rmtree(wt_path)
+        same_as_repo = wt_path.resolve() == repo.resolve()
+    except OSError:
+        same_as_repo = wt_path == repo
+    if same_as_repo:
+        raise RuntimeError(
+            f"Refusing to remove '{name}': it is the main repository working tree, "
+            "not a linked worktree."
+        )
 
+    # If the worktree is already gone from disk (deleted outside Super Worker —
+    # e.g. after merging and running `git worktree remove`), there is nothing
+    # to remove: skip straight to pruning stale admin state + branch cleanup so
+    # the caller can still drop it from state and close the tab. Never raise
+    # here — a stale tab you can't close is worse than a no-op.
+    if wt_path.exists():
+        try:
+            args = ["remove"]
+            if force:
+                args.append("--force")
+            args.append(str(wt_path))
+            git_repo.git.worktree(*args)
+        except gitpython.GitCommandError as e:
+            stderr = str(e.stderr or e)
+            if not force and "contains modified or untracked files" in stderr:
+                raise RuntimeError(
+                    f"Worktree has uncommitted changes. Use --force to remove anyway.\n{stderr}"
+                ) from e
+            if not force:
+                raise RuntimeError(f"Failed to remove worktree: {stderr}") from e
+            # force=True: git couldn't remove it (e.g. no longer registered as a
+            # worktree). Delete the directory ONLY if it's a genuine linked
+            # worktree (its `.git` is a gitdir-pointer file, never a real repo).
+            # If it's some other directory, leave it on disk but still fall
+            # through — we don't want an un-closable tab over a stray folder.
+            if (wt_path / ".git").is_file():
+                shutil.rmtree(wt_path, ignore_errors=True)
+            else:
+                logger.warning(
+                    "git could not remove worktree '%s' and it is not a linked "
+                    "worktree dir; leaving the directory in place: %s", wt_path, stderr,
+                )
+
+    # Prune stale worktree admin entries — this is what cleans up a worktree
+    # that was deleted outside Super Worker.
     try:
         git_repo.git.worktree("prune")
     except gitpython.GitCommandError:
@@ -249,7 +285,10 @@ def get_branch_status(wt_path: str, remote: str = "origin", main_branch: str = "
         output = repo.git.rev_list("--left-right", "--count", f"{remote}/{main_branch}...HEAD")
         parts = output.strip().split("\t")
         value = {"behind": int(parts[0]), "ahead": int(parts[1])}
-    except (gitpython.GitCommandError, gitpython.InvalidGitRepositoryError, IndexError, ValueError):
+    except (gitpython.NoSuchPathError, gitpython.GitCommandError,
+            gitpython.InvalidGitRepositoryError, IndexError, ValueError):
+        # NoSuchPathError: the worktree dir is gone (deleted outside sw) — a
+        # stale tab must still render, not crash the sidebar/periodic refresh.
         value = {"behind": 0, "ahead": 0}
     with _cache_lock:
         _branch_status_cache[wt_path] = (now, value)
@@ -267,7 +306,7 @@ def get_worktree_dirty(wt_path: str) -> bool:
     try:
         repo = gitpython.Repo(wt_path)
         value = repo.is_dirty(untracked_files=True)
-    except (gitpython.InvalidGitRepositoryError, gitpython.GitCommandError):
+    except (gitpython.NoSuchPathError, gitpython.InvalidGitRepositoryError, gitpython.GitCommandError):
         value = False
     with _cache_lock:
         _dirty_cache[wt_path] = (now, value)
@@ -286,6 +325,16 @@ def invalidate_git_cache(wt_path: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+# Repo-open failures (worktree dir deleted out from under us, or corrupted)
+# must be caught alongside command failures — these run in workers with
+# exit_on_error=True, so an uncaught exception crashes the whole app.
+_GIT_ERRORS = (
+    gitpython.GitCommandError,
+    gitpython.InvalidGitRepositoryError,
+    gitpython.NoSuchPathError,
+)
+
+
 def git_push(wt_path: str, remote: str, branch: str) -> str | None:
     """Push branch to remote. Returns error message or None on success."""
     try:
@@ -293,8 +342,8 @@ def git_push(wt_path: str, remote: str, branch: str) -> str | None:
         repo.git.push("-u", remote, branch)
         invalidate_git_cache(wt_path)
         return None
-    except gitpython.GitCommandError as e:
-        return str(e.stderr or e)[:200]
+    except _GIT_ERRORS as e:
+        return str(getattr(e, "stderr", None) or e)[:200]
 
 
 def git_pull(wt_path: str, remote: str, main_branch: str) -> str | None:
@@ -304,20 +353,32 @@ def git_pull(wt_path: str, remote: str, main_branch: str) -> str | None:
         repo.git.pull(remote, main_branch)
         invalidate_git_cache(wt_path)
         return None
-    except gitpython.GitCommandError as e:
-        return str(e.stderr or e)[:200]
+    except _GIT_ERRORS as e:
+        return str(getattr(e, "stderr", None) or e)[:200]
 
 
-def git_commit(wt_path: str, message: str) -> str | None:
-    """Stage modified files and commit. Returns error message or None on success."""
+def git_commit(wt_path: str, message: str, exclude: list[str] | None = None) -> str | None:
+    """Stage all changes and commit. Returns error message or None on success.
+
+    Uses ``git add -A`` so files Claude *created* are committed too (``-u``
+    silently dropped every new file). ``exclude`` names — the sw-managed
+    symlinks/copies like ``.venv`` or ``.env`` — are unstaged before commit so
+    a copied secret is never committed, even in worktrees created before these
+    paths were added to git's exclude file.
+    """
     try:
         repo = gitpython.Repo(wt_path)
-        repo.git.add("-u")
+        repo.git.add("-A")
+        for name in exclude or []:
+            try:
+                repo.git.reset("-q", "--", name)
+            except gitpython.GitCommandError:
+                pass  # not staged / doesn't exist — nothing to unstage
         repo.git.commit("-m", message)
         invalidate_git_cache(wt_path)
         return None
-    except gitpython.GitCommandError as e:
-        return str(e.stderr or e)[:200]
+    except _GIT_ERRORS as e:
+        return str(getattr(e, "stderr", None) or e)[:200]
 
 
 def git_create_pr(wt_path: str, branch: str, open_browser: bool = True) -> tuple[bool, str]:
@@ -325,22 +386,37 @@ def git_create_pr(wt_path: str, branch: str, open_browser: bool = True) -> tuple
 
     If open_browser is True and PR creation succeeds, opens the URL in a browser.
     """
-    # Check gh auth
-    result = subprocess.run(
-        ["gh", "auth", "status"],
-        capture_output=True, text=True, timeout=10,
-    )
+    # gh is optional (README) — a missing binary raises FileNotFoundError,
+    # and a hung gh could raise TimeoutExpired; both must be handled or the
+    # PR button crashes the app.
+    try:
+        result = subprocess.run(
+            ["gh", "auth", "status"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except FileNotFoundError:
+        return False, "GitHub CLI (gh) is not installed. See https://cli.github.com/"
+    except subprocess.TimeoutExpired:
+        return False, "gh auth status timed out."
     if result.returncode != 0:
-        return False, "gh CLI not installed or not authenticated. Run: gh auth login"
+        return False, "gh CLI not authenticated. Run: gh auth login"
 
-    result = subprocess.run(
-        ["gh", "pr", "create", "--fill", "--head", branch],
-        cwd=wt_path, capture_output=True, text=True, timeout=60,
-    )
+    try:
+        result = subprocess.run(
+            ["gh", "pr", "create", "--fill", "--head", branch],
+            cwd=wt_path, capture_output=True, text=True, timeout=60,
+        )
+    except FileNotFoundError:
+        return False, "GitHub CLI (gh) is not installed. See https://cli.github.com/"
+    except subprocess.TimeoutExpired:
+        return False, "gh pr create timed out."
     if result.returncode == 0:
         url = result.stdout.strip()
-        if open_browser:
-            webbrowser.open(url)
+        if open_browser and url:
+            try:
+                webbrowser.open(url)
+            except Exception:
+                logger.debug("Failed to open PR URL in browser", exc_info=True)
         return True, url
     return False, (result.stderr or "")[:200]
 
@@ -357,7 +433,7 @@ def discover_worktrees(config: ResolvedConfig) -> list[Worktree]:
     try:
         repo = gitpython.Repo(repo_root)
         output = repo.git.worktree("list", "--porcelain")
-    except gitpython.GitCommandError:
+    except (gitpython.GitCommandError, gitpython.InvalidGitRepositoryError, gitpython.NoSuchPathError):
         return []
 
     discovered: list[Worktree] = []
@@ -391,6 +467,12 @@ def _process_worktree_entry(
     if not wt_dir.name.startswith(prefix):
         return
     name = wt_dir.name[len(prefix):]
+    # A manually created dir like "repo-fix.stuff" would yield a name that
+    # crashes Textual at compose time (widget id "wt-fix.stuff" is invalid).
+    from super_worker.constants import is_valid_worktree_name
+    if not is_valid_worktree_name(name):
+        logger.info("Skipping discovered worktree with unusable name: %s", wt_dir.name)
+        return
     out.append(Worktree(name=name, path=path, branch=branch or "(unknown)"))
 
 

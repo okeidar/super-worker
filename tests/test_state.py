@@ -268,3 +268,222 @@ class TestRecoverDeadSessions:
         assert len(sessions) == 2
         assert sessions[0].tmux_session_name == "sw-feat-0"  # alive kept
         assert sessions[1].tmux_session_name == "sw-feat-1"  # dead claude respawned
+
+
+class TestMutateState:
+    """mutate_state: load→mutate→save under one lock, reading fresh each time."""
+
+    def test_sequential_mutations_all_persist(self, _redirect_state_dir, fake_config):
+        from super_worker.services.state import mutate_state
+
+        # Seed so the file exists.
+        save_state(
+            AppState(repo_root=str(fake_config.repo_root),
+                     worktree_base=str(fake_config.base_dir)),
+            fake_config,
+        )
+        with mutate_state(fake_config) as s:
+            s.worktrees.append(Worktree(name="a", path="/tmp/a", branch="sw-a"))
+        # A second mutate must SEE the first's write (fresh read) and add to it,
+        # not clobber it — this is the lost-update guard.
+        with mutate_state(fake_config) as s:
+            assert {w.name for w in s.worktrees} == {"a"}
+            s.worktrees.append(Worktree(name="b", path="/tmp/b", branch="sw-b"))
+
+        loaded = load_state(fake_config)
+        assert {w.name for w in loaded.worktrees} == {"a", "b"}
+
+    def test_mutate_reads_external_change(self, _redirect_state_dir, fake_config):
+        """A change written between mutations is visible to the next mutate."""
+        from super_worker.services.state import mutate_state
+
+        st = AppState(repo_root=str(fake_config.repo_root),
+                      worktree_base=str(fake_config.base_dir),
+                      worktrees=[Worktree(name="ext", path="/tmp/ext", branch="sw-ext")])
+        save_state(st, fake_config)  # simulate another process's write
+
+        with mutate_state(fake_config) as s:
+            assert any(w.name == "ext" for w in s.worktrees), "mutate must read fresh state"
+            s.worktrees.append(Worktree(name="mine", path="/tmp/mine", branch="sw-mine"))
+
+        loaded = load_state(fake_config)
+        assert {w.name for w in loaded.worktrees} == {"ext", "mine"}
+
+
+class TestSessionNameDedup:
+    """Duplicate tmux session names → wrong-conversation resume. Must be healed."""
+
+    def test_dedupe_renames_duplicates(self, _redirect_state_dir):
+        from super_worker.services.state import dedupe_session_names
+        # Two sessions in one worktree share a tmux name (the real corruption seen)
+        wt = Worktree(name="main", path="/repo/x", branch="main", sessions=[
+            Session(tmux_session_name="sw-main-abc-3", label="a", claude_session_id="id-A"),
+            Session(tmux_session_name="sw-main-abc-4", label="b", claude_session_id="id-B"),
+            Session(tmux_session_name="sw-main-abc-3", label="c", claude_session_id="id-C"),
+        ])
+        state = AppState(repo_root="/repo/x", worktree_base="/repo", worktrees=[wt])
+
+        assert dedupe_session_names(state) is True
+        names = [s.tmux_session_name for s in wt.sessions]
+        assert len(set(names)) == 3, "all session names must be unique after dedup"
+        # conversation ids are preserved so recovery resumes the right ones
+        assert {s.claude_session_id for s in wt.sessions} == {"id-A", "id-B", "id-C"}
+
+    def test_dedupe_noop_when_unique(self, _redirect_state_dir):
+        from super_worker.services.state import dedupe_session_names
+        wt = Worktree(name="main", path="/repo/y", branch="main", sessions=[
+            Session(tmux_session_name="sw-main-def-0", label="a"),
+            Session(tmux_session_name="sw-main-def-1", label="b"),
+        ])
+        state = AppState(repo_root="/repo/y", worktree_base="/repo", worktrees=[wt])
+        assert dedupe_session_names(state) is False
+
+
+class TestFindAvailableNameNoDup:
+    def test_avoids_sibling_state_names(self, monkeypatch):
+        """A new session must not reuse a name already held by a sibling in state."""
+        from unittest.mock import MagicMock
+        import super_worker.services.tmux as tm
+        server = MagicMock()
+        server.sessions = []  # nothing live
+        monkeypatch.setattr(tm, "_get_server", lambda: server)
+
+        from super_worker.services.tmux import _find_available_session_name, _worktree_scope, tmux_session_name
+        scope = _worktree_scope(Worktree(name="main", path="/r", branch="m"))
+        wt = Worktree(name="main", path="/r", branch="m", sessions=[
+            Session(tmux_session_name=tmux_session_name("main", 0, scope), label="a"),
+            Session(tmux_session_name=tmux_session_name("main", 1, scope), label="b"),
+        ])
+        name = _find_available_session_name(wt)
+        assert name not in {s.tmux_session_name for s in wt.sessions}
+
+    def test_reserved_names_excluded(self, monkeypatch):
+        from unittest.mock import MagicMock
+        import super_worker.services.tmux as tm
+        server = MagicMock(); server.sessions = []
+        monkeypatch.setattr(tm, "_get_server", lambda: server)
+        from super_worker.services.tmux import _find_available_session_name
+        wt = Worktree(name="main", path="/r2", branch="m")
+        first = _find_available_session_name(wt)
+        second = _find_available_session_name(wt, reserved={first})
+        assert second != first
+
+
+class TestRecoveryNoWrongSession:
+    """End-to-end: duplicate names + distinct conversations must recover 1:1."""
+
+    def test_recover_gives_distinct_names_and_ids(self, _redirect_state_dir, monkeypatch, tmp_path):
+        import super_worker.services.state as sm
+
+        # All dead; two share a name; three distinct conversation ids.
+        repo = tmp_path / "repo-z"
+        repo.mkdir()
+        wt = Worktree(name="main", path=str(repo), branch="main", sessions=[
+            Session(tmux_session_name="sw-main-z-3", label="a", claude_session_id="conv-A"),
+            Session(tmux_session_name="sw-main-z-4", label="b", claude_session_id="conv-B"),
+            Session(tmux_session_name="sw-main-z-3", label="c", claude_session_id="conv-C"),
+        ])
+        state = AppState(repo_root=str(repo), worktree_base=str(tmp_path), worktrees=[wt])
+
+        # dedupe first (as reconcile does), then recover
+        sm.dedupe_session_names(state)
+
+        monkeypatch.setattr(sm, "is_session_alive", lambda name: False)
+        monkeypatch.setattr(sm, "_conversation_exists", lambda path, sid: True)  # ids are valid
+        monkeypatch.setattr(sm, "respawn_pane", lambda name, cmd: False)  # force recreate path
+
+        created = []
+        def fake_create(worktree, **kw):
+            # emulate real create_session naming: honor reserved + resume id
+            from super_worker.services.tmux import _find_available_session_name
+            reserved = kw.get("reserved_names")
+            name = _find_available_session_name(worktree, reserved=reserved)
+            s = Session(tmux_session_name=name, label=kw.get("label", "x"),
+                        claude_session_id=kw.get("resume_session_id"))
+            created.append(s)
+            return s
+        monkeypatch.setattr(sm, "create_session", fake_create)
+        # no live sessions on the mock server for name-finding
+        from unittest.mock import MagicMock
+        import super_worker.services.tmux as tm
+        srv = MagicMock(); srv.sessions = []
+        monkeypatch.setattr(tm, "_get_server", lambda: srv)
+
+        assert sm.recover_dead_sessions(state) is True
+        names = [s.tmux_session_name for s in wt.sessions]
+        ids = [s.claude_session_id for s in wt.sessions]
+        assert len(set(names)) == 3, "each recovered session must have a unique tmux name"
+        assert set(ids) == {"conv-A", "conv-B", "conv-C"}, "each conversation resumed exactly once"
+
+
+class TestResumePerSession:
+    """Each session resumes ITS OWN conversation — never a blanket --continue,
+    which would collapse multiple sessions onto the latest conversation."""
+
+    def test_present_conversation_uses_resume(self, _redirect_state_dir, monkeypatch, tmp_path):
+        import super_worker.services.state as sm
+        repo = tmp_path / "repo-p"; repo.mkdir()
+        wt = Worktree(name="main", path=str(repo), branch="main", sessions=[
+            Session(tmux_session_name="sw-main-p-0", label="a", claude_session_id="real-id"),
+        ])
+        state = AppState(repo_root=str(repo), worktree_base=str(tmp_path), worktrees=[wt])
+        monkeypatch.setattr(sm, "is_session_alive", lambda name: False)
+        monkeypatch.setattr(sm, "_conversation_exists", lambda path, sid: True)
+        cap = {}
+        monkeypatch.setattr(sm, "respawn_pane", lambda name, cmd: cap.setdefault("cmd", cmd) or True)
+        assert sm.recover_dead_sessions(state) is True
+        assert "--resume real-id" in cap["cmd"]
+        assert "--continue" not in cap["cmd"]
+
+    def test_id_without_conversation_uses_session_id_not_continue(self, _redirect_state_dir, monkeypatch, tmp_path):
+        """A pinned id with no file yet → fresh --session-id <id> (keeps its id,
+        no hijacking the latest conversation). Must NOT be --continue."""
+        import super_worker.services.state as sm
+        repo = tmp_path / "repo-m"; repo.mkdir()
+        wt = Worktree(name="main", path=str(repo), branch="main", sessions=[
+            Session(tmux_session_name="sw-main-m-0", label="a", claude_session_id="ghost-id"),
+        ])
+        state = AppState(repo_root=str(repo), worktree_base=str(tmp_path), worktrees=[wt])
+        monkeypatch.setattr(sm, "is_session_alive", lambda name: False)
+        monkeypatch.setattr(sm, "_conversation_exists", lambda path, sid: False)
+        cap = {}
+        monkeypatch.setattr(sm, "respawn_pane", lambda name, cmd: cap.setdefault("cmd", cmd) or True)
+        assert sm.recover_dead_sessions(state) is True
+        assert "--session-id ghost-id" in cap["cmd"]
+        assert "--continue" not in cap["cmd"]
+        assert "--resume" not in cap["cmd"]
+
+    def test_multiple_sessions_each_resume_their_own(self, _redirect_state_dir, monkeypatch, tmp_path):
+        """THE core case: 3 sessions in one worktree, all with real conversations,
+        each recovers via --resume of its OWN id — none via --continue."""
+        import super_worker.services.state as sm
+        repo = tmp_path / "repo-multi"; repo.mkdir()
+        wt = Worktree(name="main", path=str(repo), branch="main", sessions=[
+            Session(tmux_session_name="sw-main-x-0", label="a", claude_session_id="conv-A"),
+            Session(tmux_session_name="sw-main-x-1", label="b", claude_session_id="conv-B"),
+            Session(tmux_session_name="sw-main-x-2", label="c", claude_session_id="conv-C"),
+        ])
+        state = AppState(repo_root=str(repo), worktree_base=str(tmp_path), worktrees=[wt])
+        monkeypatch.setattr(sm, "is_session_alive", lambda name: False)
+        monkeypatch.setattr(sm, "_conversation_exists", lambda path, sid: True)  # all real
+        cmds = []
+        monkeypatch.setattr(sm, "respawn_pane", lambda name, cmd: cmds.append(cmd) or True)
+        assert sm.recover_dead_sessions(state) is True
+        joined = "\n".join(cmds)
+        for cid in ("conv-A", "conv-B", "conv-C"):
+            assert f"--resume {cid}" in joined, f"{cid} must resume itself"
+        assert "--continue" not in joined, "no session may use --continue when it has its own id"
+
+    def test_legacy_no_id_uses_continue(self, _redirect_state_dir, monkeypatch, tmp_path):
+        """Only a legacy session with NO stored id may fall back to --continue."""
+        import super_worker.services.state as sm
+        repo = tmp_path / "repo-legacy"; repo.mkdir()
+        wt = Worktree(name="main", path=str(repo), branch="main", sessions=[
+            Session(tmux_session_name="sw-main-l-0", label="a", claude_session_id=None),
+        ])
+        state = AppState(repo_root=str(repo), worktree_base=str(tmp_path), worktrees=[wt])
+        monkeypatch.setattr(sm, "is_session_alive", lambda name: False)
+        cap = {}
+        monkeypatch.setattr(sm, "respawn_pane", lambda name, cmd: cap.setdefault("cmd", cmd) or True)
+        assert sm.recover_dead_sessions(state) is True
+        assert "--continue" in cap["cmd"]

@@ -36,11 +36,13 @@ from super_worker.services.tmux import (
     create_session,
     enable_mouse,
     has_waiting_approval,
+    is_session_alive,
     kill_all_sessions,
     kill_session,
     open_external_terminal,
     read_all_state_files,
     read_state_file,
+    set_window_size,
     verify_waiting_approval,
 )
 from super_worker.services.worktree import (
@@ -53,7 +55,6 @@ from super_worker.services.worktree import (
     git_pull,
     git_push,
     invalidate_git_cache,
-    list_local_branches,
     remove_worktree,
 )
 from super_worker.widgets.sidebar import GitAction, SessionDeleted, SessionSelected, SessionSidebar
@@ -64,6 +65,21 @@ logger = logging.getLogger(__name__)
 
 class WorktreeTabContent(Horizontal):
     """Sidebar + terminal for a single worktree tab."""
+
+    class Initialized(Message):
+        """Posted when a worktree tab finishes wiring up its first session.
+
+        Carries the first session's name so ProjectView can adopt it as active
+        (the session is created asynchronously here, after ProjectView.on_mount
+        has already run), and ``created`` so state is persisted only when a new
+        session was actually made.
+        """
+
+        def __init__(self, worktree_name: str, first_session_name: str | None, created: bool) -> None:
+            self.worktree_name = worktree_name
+            self.first_session_name = first_session_name
+            self.created = created
+            super().__init__()
 
     DEFAULT_CSS = """
     WorktreeTabContent {
@@ -84,9 +100,11 @@ class WorktreeTabContent(Horizontal):
 
     def on_mount(self) -> None:
         async def _init_sidebar() -> None:
+            created = False
             if not self.worktree.sessions:
                 session = await asyncio.to_thread(create_session, self.worktree)
                 self.worktree.sessions.append(session)
+                created = True
 
             session_names = [s.tmux_session_name for s in self.worktree.sessions]
             states = await asyncio.to_thread(batch_detect_session_states, session_names) if session_names else {}
@@ -95,12 +113,20 @@ class WorktreeTabContent(Horizontal):
             sidebar = self.query_one(SessionSidebar)
             sidebar.show_worktree(self.worktree, states=states, git_status=status, git_dirty=dirty)
 
+            first_name = None
             if self.worktree.sessions:
                 first = self.worktree.sessions[0]
+                first_name = first.tmux_session_name
                 terminal = self.query_one(TerminalPane)
-                terminal.active_session = first.tmux_session_name
+                terminal.active_session = first_name
 
-        self.app.run_worker(_init_sidebar, exclusive=False)
+            # Let ProjectView (which owns state+config) adopt the active
+            # session and persist a newly-created one.
+            self.post_message(self.Initialized(self.worktree.name, first_name, created))
+
+        # Widget-node worker: auto-cancelled if this tab unmounts mid-init,
+        # and immune to exclusive workers on the App node.
+        self.run_worker(_init_sidebar, exclusive=False)
 
 
 class ProjectView(Widget):
@@ -138,7 +164,12 @@ class ProjectView(Widget):
         self._active_worktree: Worktree | None = None
         self._active_session_name: str | None = None
         self._cached_session_states: dict[str, SessionState] = {}
-        self._ensure_default_worktree()
+        # Only ensure the "main" worktree EXISTS in state (cheap, needed before
+        # compose builds the tabs). Its tmux session is created lazily and
+        # off the event loop by WorktreeTabContent.on_mount — creating it here
+        # ran a blocking `tmux new-session` + state write during __init__,
+        # janking project open.
+        ensure_default_worktree(self._state, self._config)
 
     @property
     def config(self) -> ResolvedConfig:
@@ -147,15 +178,6 @@ class ProjectView(Widget):
     @property
     def state(self) -> AppState:
         return self._state
-
-    def _ensure_default_worktree(self) -> None:
-        ensure_default_worktree(self._state, self._config)
-        # TUI mode also needs at least one tmux session per worktree
-        wt = self._state.get_worktree(DEFAULT_WORKTREE_NAME)
-        if wt and not wt.sessions:
-            session = create_session(wt)
-            wt.sessions.append(session)
-        save_state(self._state, self._config)
 
     def compose(self) -> ComposeResult:
         if self._state.worktrees:
@@ -241,6 +263,21 @@ class ProjectView(Widget):
         except Exception:
             pass
 
+    def focus_terminal(self) -> None:
+        """Focus the active worktree's terminal pane.
+
+        Called when this project becomes active (or the drawer closes) so
+        keystrokes reach the visible session — without it, focus can stay on
+        a hidden widget and input is silently misrouted.
+        """
+        if not self._active_worktree:
+            return
+        try:
+            wtc = self.query_one(f"#wtc-{self._active_worktree.name}", WorktreeTabContent)
+            wtc.query_one(TerminalPane).focus()
+        except Exception:
+            pass
+
     def _set_active_worktree(self, wt: Worktree) -> None:
         # Pause the old worktree's terminal captures (keeps content + state watches)
         old_wt = self._active_worktree
@@ -283,6 +320,31 @@ class ProjectView(Widget):
             if wt:
                 self._set_active_worktree(wt)
 
+    def on_worktree_tab_content_initialized(
+        self, event: "WorktreeTabContent.Initialized"
+    ) -> None:
+        """A worktree tab finished init — adopt its session and persist if new."""
+        event.stop()
+        # Adopt the session as active if the active worktree still has none
+        # (its session was created async, after on_mount ran) — without this
+        # Ctrl+A/Ctrl+S right after open would wrongly report no active session.
+        if (
+            self._active_worktree
+            and self._active_worktree.name == event.worktree_name
+            and not self._active_session_name
+            and event.first_session_name
+        ):
+            self._active_session_name = event.first_session_name
+            self._update_app_subtitle()
+        if event.created:
+            # Persist off the event loop; exclusive so concurrent tab inits
+            # don't write the shared state file at the same time.
+            self.run_worker(
+                lambda: save_state(self._state, self._config),
+                thread=True, group="persist-state", exclusive=True,
+            )
+        self._start_state_watching()
+
     def on_terminal_pane_state_changed(self, event: TerminalPane.StateChanged) -> None:
         """Session state changed (via kqueue on state file) — update UI instantly."""
         name = event.session_name
@@ -309,7 +371,10 @@ class ProjectView(Widget):
             try:
                 wtc = self.query_one(f"#wtc-{wt.name}", WorktreeTabContent)
                 sidebar = wtc.query_one(SessionSidebar)
-                sidebar.show_worktree(wt, states=self._cached_session_states)
+                # State-change events are frequent (kqueue) — don't run git
+                # subprocesses on the event loop here; periodic_refresh owns
+                # git status. This only repaints the session dots.
+                sidebar.show_worktree(wt, states=self._cached_session_states, refresh_git=False)
             except Exception:
                 pass
 
@@ -381,8 +446,6 @@ class ProjectView(Widget):
     # ── Public delegation API ─────────────────────────────────────────────────
 
     def do_new_worktree(self) -> None:
-        branches = list_local_branches(self._config.repo_root)
-
         def handle_result(result: tuple[str, str | None, str | None, bool, bool, bool] | None) -> None:
             if result is None:
                 return
@@ -392,7 +455,8 @@ class ProjectView(Widget):
                 return
             self._create_worktree(name, prompt, branch=branch, use_existing_branch=use_existing, detach=detach, skip_permissions=skip_perms)
 
-        self.app.push_screen(NewWorktreeScreen(self._config, branches=branches), callback=handle_result)
+        # No synchronous git here — NewWorktreeScreen doesn't need a branch list.
+        self.app.push_screen(NewWorktreeScreen(self._config), callback=handle_result)
 
     def _create_worktree(
         self,
@@ -510,6 +574,11 @@ class ProjectView(Widget):
             self.app.notify("No active session to attach", severity="warning")
             return
         session_name = self._active_session_name
+        # Don't suspend the whole TUI to attach to a session that isn't
+        # running — the user would just see tmux flash "no such session".
+        if not is_session_alive(session_name):
+            self.app.notify("Session is not running (dead pane).", severity="warning")
+            return
         try:
             wtc = self.query_one(f"#wtc-{self._active_worktree.name}", WorktreeTabContent)
             terminal = wtc.query_one(TerminalPane)
@@ -517,6 +586,9 @@ class ProjectView(Widget):
         except Exception:
             logger.debug("Failed to pause terminal before attach", exc_info=True)
         enable_mouse(session_name)
+        # Let the real attach fill the attaching terminal. When the preview
+        # resumes (active_session set below), it flips back to manual sizing.
+        set_window_size(session_name, "latest")
         with self.app.suspend():
             q = shlex.quote(session_name)
             subprocess.run([
@@ -543,6 +615,9 @@ class ProjectView(Widget):
 
         async def _open() -> None:
             await asyncio.to_thread(enable_mouse, session_name)
+            # Let the external terminal window dictate the session size —
+            # otherwise it stays pinned at the preview's manual size.
+            await asyncio.to_thread(set_window_size, session_name, "latest")
             opened = await asyncio.to_thread(open_external_terminal, session_name)
             if not opened:
                 self.app.notify("No terminal emulator found. Use Ctrl+A to attach.", severity="warning")
@@ -578,23 +653,34 @@ class ProjectView(Widget):
                 target = self._state.get_worktree(wt_name)
                 if not target:
                     return
+                await asyncio.to_thread(kill_all_sessions, target)
+                # Git cleanup is best-effort: a worktree deleted outside Super
+                # Worker (merged + pruned) can't be git-removed, but the user
+                # must still be able to close the stale tab. So NEVER let a git
+                # error block removal from state / closing the tab.
+                git_err = None
                 try:
-                    await asyncio.to_thread(kill_all_sessions, target)
                     await asyncio.to_thread(
                         remove_worktree, self._state, wt_name,
                         force=True, delete_branch=del_branch,
                         remote=self._config.remote,
                     )
-                    self._state = remove_worktree_from_state(self._state, wt_name)
-                    await asyncio.to_thread(save_state, self._state, self._config)
                 except Exception as e:
-                    self.app.notify(str(e), severity="error")
-                    return
+                    git_err = str(e)
+                    logger.debug("git cleanup failed removing worktree %s", wt_name, exc_info=True)
 
+                self._state = remove_worktree_from_state(self._state, wt_name)
+                await asyncio.to_thread(save_state, self._state, self._config)
                 self._active_worktree = None
                 self._active_session_name = None
                 await self._remove_worktree_tab(wt.name)
-                self.app.notify(f"Deleted worktree: {wt.name}")
+                if git_err:
+                    self.app.notify(
+                        f"Removed '{wt.name}' from Super Worker (git cleanup skipped: {git_err[:80]})",
+                        severity="warning",
+                    )
+                else:
+                    self.app.notify(f"Deleted worktree: {wt.name}")
 
             self.run_worker(_delete, exclusive=False)
 
@@ -617,11 +703,18 @@ class ProjectView(Widget):
                         return
                 self._set_active_worktree(self._state.worktrees[0])
         except Exception:
-            logger.debug("Failed to remove worktree tab", exc_info=True, extra={"name": name})
+            logger.debug("Failed to remove worktree tab", exc_info=True, extra={"worktree": name})
 
     # ── Periodic refresh ──────────────────────────────────────────────────────
 
     async def check_attention(self) -> None:
+        """Crash-proof wrapper: this runs in a 5s worker with exit_on_error=True."""
+        try:
+            await self._check_attention_impl()
+        except Exception:
+            logger.debug("check_attention failed", exc_info=True)
+
+    async def _check_attention_impl(self) -> None:
         """Lightweight state-only check for non-active projects.
 
         Reads state files (no subprocess calls) for instant attention detection.
@@ -639,6 +732,13 @@ class ProjectView(Widget):
             ))
 
     async def periodic_refresh(self) -> None:
+        """Crash-proof wrapper: this runs in a 5s worker with exit_on_error=True."""
+        try:
+            await self._periodic_refresh_impl()
+        except Exception:
+            logger.debug("periodic_refresh failed", exc_info=True)
+
+    async def _periodic_refresh_impl(self) -> None:
         """Fetch git data and detect dead sessions. Called by app timer.
 
         State detection is event-driven via kqueue on state files (see
@@ -780,7 +880,8 @@ class ProjectView(Widget):
                 return
 
             async def _commit() -> None:
-                err = await asyncio.to_thread(git_commit, wt.path, msg)
+                exclude = list(self._config.copies) + list(self._config.symlinks)
+                err = await asyncio.to_thread(git_commit, wt.path, msg, exclude)
                 if err:
                     self.app.notify(f"Commit failed: {err[:100]}", severity="error")
                 else:

@@ -136,6 +136,37 @@ class TestCreateSession:
         cmd = server.new_session.call_args[1]["window_command"]
         assert "--continue" in cmd
 
+    def test_new_claude_session_pins_session_id(self, monkeypatch):
+        """A fresh claude session gets a stable --session-id stored on the model."""
+        server = self._mock_server(monkeypatch)
+        wt = Worktree(name="feat", path="/tmp/feat", branch="main")
+
+        session = create_session(wt)
+
+        assert session.claude_session_id is not None
+        cmd = server.new_session.call_args[1]["window_command"]
+        assert f"--session-id {session.claude_session_id}" in cmd
+
+    def test_resume_specific_session_id(self, monkeypatch):
+        """Resuming with a known id uses --resume <id>, not --continue."""
+        server = self._mock_server(monkeypatch)
+        wt = Worktree(name="feat", path="/tmp/feat", branch="main")
+
+        session = create_session(wt, resume=True, resume_session_id="abc-123")
+
+        cmd = server.new_session.call_args[1]["window_command"]
+        assert "--resume abc-123" in cmd
+        assert "--continue" not in cmd
+        assert session.claude_session_id == "abc-123"
+
+    def test_terminal_session_has_no_session_id(self, monkeypatch):
+        self._mock_server(monkeypatch)
+        wt = Worktree(name="feat", path="/tmp/feat", branch="main")
+
+        session = create_session(wt, session_type="terminal")
+
+        assert session.claude_session_id is None
+
     def test_creates_terminal_session(self, monkeypatch):
         server = self._mock_server(monkeypatch)
         monkeypatch.setenv("SHELL", "/bin/zsh")
@@ -150,14 +181,29 @@ class TestCreateSession:
         assert "/bin/zsh" in cmd
 
     def test_avoids_name_collision(self, monkeypatch):
-        existing = MagicMock()
-        existing.session_name = "sw-feat-0"
-        self._mock_server(monkeypatch, existing_sessions=[existing])
+        from super_worker.services.tmux import _worktree_scope, tmux_session_name
         wt = Worktree(name="feat", path="/tmp/feat", branch="main")
+        scope = _worktree_scope(wt)
+        existing = MagicMock()
+        existing.session_name = tmux_session_name("feat", 0, scope)  # index 0 taken
+        self._mock_server(monkeypatch, existing_sessions=[existing])
 
         session = create_session(wt)
 
-        assert session.tmux_session_name == "sw-feat-1"
+        assert session.tmux_session_name == tmux_session_name("feat", 1, scope)
+
+    def test_session_name_scoped_per_project(self, monkeypatch):
+        """Same-named worktrees in different repos get distinct session names."""
+        from super_worker.services.tmux import _worktree_scope
+        wt_a = Worktree(name="main", path="/repo-a", branch="main")
+        wt_b = Worktree(name="main", path="/repo-b", branch="main")
+        assert _worktree_scope(wt_a) != _worktree_scope(wt_b)
+
+        self._mock_server(monkeypatch)
+        a = create_session(wt_a)
+        self._mock_server(monkeypatch)
+        b = create_session(wt_b)
+        assert a.tmux_session_name != b.tmux_session_name
 
 
 def test_kill_session_handles_missing(monkeypatch):
@@ -327,3 +373,30 @@ class TestCreateSessionRemainOnExit:
         create_session(wt)
 
         mock_tmux_session.set_option.assert_any_call("remain-on-exit", "on")
+
+
+class TestBracketedPaste:
+    def test_paste_uses_bracketed_paste_buffer(self, monkeypatch, tmp_path):
+        """paste_to_pane loads a buffer then paste-buffer -p (bracketed, if app wants it)."""
+        from unittest.mock import MagicMock
+        from super_worker.services.tmux import paste_to_pane
+
+        server = MagicMock()
+        monkeypatch.setattr("super_worker.services.tmux._get_server", lambda: server)
+
+        paste_to_pane("sw-x-0", "multi\nline\ntext")
+
+        calls = [c.args for c in server.cmd.call_args_list]
+        assert any(c[0] == "load-buffer" for c in calls), "must load the text into a tmux buffer"
+        paste = next((c for c in calls if c[0] == "paste-buffer"), None)
+        assert paste is not None, "must paste-buffer"
+        assert "-p" in paste, "must request bracketed paste (-p)"
+        assert "sw-x-0" in paste, "must target the session"
+
+    def test_paste_empty_is_noop(self, monkeypatch):
+        from unittest.mock import MagicMock
+        from super_worker.services.tmux import paste_to_pane
+        server = MagicMock()
+        monkeypatch.setattr("super_worker.services.tmux._get_server", lambda: server)
+        paste_to_pane("sw-x-0", "")
+        server.cmd.assert_not_called()
