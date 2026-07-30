@@ -116,3 +116,59 @@ def test_uninstall_hooks_removes_our_entries(tmp_path, monkeypatch):
     assert "PreToolUse" not in result["hooks"]
     # Hook script removed
     assert not hook_dest.exists()
+
+
+def _sw_cmd(entry):
+    return entry["hooks"][0]["command"]
+
+
+def test_notification_matchers_route_to_states(tmp_path, monkeypatch):
+    """Notification is routed by matcher: approval/elicitation/agent-input → bell,
+    idle → waiting_input. This is what makes questionnaires light up the bell."""
+    _, claude_settings = _setup_hooks_env(tmp_path, monkeypatch)
+    install_hooks()
+    hooks = json.loads(claude_settings.read_text())["hooks"]
+
+    notif = hooks["Notification"]
+    by_matcher = {e.get("matcher"): _sw_cmd(e) for e in notif}
+    assert "waiting_approval" in by_matcher["permission_prompt"]
+    assert "waiting_approval" in by_matcher["elicitation_dialog"]
+    assert "waiting_approval" in by_matcher["agent_needs_input"]
+    assert "waiting_input" in by_matcher["idle_prompt"]
+
+
+def test_user_prompt_submit_clears_attention(tmp_path, monkeypatch):
+    """UserPromptSubmit → running so the bell clears the moment the user acts."""
+    _, claude_settings = _setup_hooks_env(tmp_path, monkeypatch)
+    install_hooks()
+    hooks = json.loads(claude_settings.read_text())["hooks"]
+    assert "UserPromptSubmit" in hooks
+    assert "running" in _sw_cmd(hooks["UserPromptSubmit"][0])
+
+
+def test_install_idempotent_with_notification_matchers(tmp_path, monkeypatch):
+    """Re-installing doesn't duplicate the multi-entry Notification hooks."""
+    _, claude_settings = _setup_hooks_env(tmp_path, monkeypatch)
+    install_hooks()
+    install_hooks()
+    hooks = json.loads(claude_settings.read_text())["hooks"]
+    assert len(hooks["Notification"]) == 4
+    assert len(hooks["UserPromptSubmit"]) == 1
+
+
+def test_uninstall_removes_notification_and_userprompt(tmp_path, monkeypatch):
+    """uninstall removes the new events too, preserving unrelated user hooks."""
+    _, claude_settings = _setup_hooks_env(tmp_path, monkeypatch)
+    claude_settings.parent.mkdir(parents=True, exist_ok=True)
+    claude_settings.write_text(json.dumps({
+        "hooks": {"Notification": [{"matcher": "idle_prompt",
+                                    "hooks": [{"type": "command", "command": "echo mine"}]}]},
+    }))
+    install_hooks()
+    uninstall_hooks()
+    hooks = json.loads(claude_settings.read_text()).get("hooks", {})
+    # our entries gone; the user's custom Notification hook preserved
+    remaining = hooks.get("Notification", [])
+    assert all("sw-hook.sh" not in _sw_cmd(e) for e in remaining)
+    assert any(_sw_cmd(e) == "echo mine" for e in remaining)
+    assert "UserPromptSubmit" not in hooks

@@ -95,10 +95,9 @@ class NewWorktreeScreen(_ModalNavMixin, ModalScreen[tuple[str, str | None, str |
     }
     """
 
-    def __init__(self, config: ResolvedConfig, branches: list[str] | None = None) -> None:
+    def __init__(self, config: ResolvedConfig) -> None:
         super().__init__()
         self._config = config
-        self._branches = branches or []
 
     def compose(self) -> ComposeResult:
         with Vertical(id="new-wt-dialog"):

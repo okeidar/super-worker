@@ -14,6 +14,10 @@ class Session(BaseModel):
     session_type: str = Field(default="claude")
     initial_prompt: str | None = None
     skip_permissions: bool = False
+    # Claude Code conversation id (set via `claude --session-id`). Lets recovery
+    # resume THIS session's own conversation (`--resume <id>`) instead of the
+    # blunt `--continue`, which always reopens the single most-recent one.
+    claude_session_id: str | None = None
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 

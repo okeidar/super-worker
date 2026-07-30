@@ -5,8 +5,8 @@ TUI and CLI for managing multiple Claude Code sessions across git worktrees.
 ## Features
 
 - **Multi-worktree management** — create isolated worktrees with their own Claude Code sessions
-- **Live terminal preview** — see session output in real-time via kqueue + tmux pipe-pane
-- **Full attach mode** — press Ctrl+A to drop into the tmux session directly
+- **Live terminal preview** — interactive preview of each session with a live cursor, full color (including diff backgrounds), and follow-tail scrolling; the tmux window is resized to match the preview so wrapping is exact
+- **Full attach mode** — press Ctrl+A to drop into the tmux session directly (mouse, alt-screen apps)
 - **Session state indicators** — live dots show running, waiting for input, or waiting for approval
 - **Attention alerts** — appears on worktree tabs and project bar when a session needs approval
 - **Multi-project support** — switch between repos with a project drawer or docked tab bar
@@ -72,7 +72,8 @@ All actions through one menu: **Ctrl+B, Space**.
 | Ctrl+S | Add session to current worktree |
 | Ctrl+A | Attach to active tmux session |
 | Ctrl+T | Open terminal session |
-| Ctrl+R | Rename active session |
+| F2 | Rename active session |
+| Ctrl+R | Claude Code transcript view (browse full conversation history) |
 | Ctrl+D | Delete current worktree |
 | Ctrl+O | Toggle project drawer |
 | Ctrl+Shift+Left/Right | Switch between projects |
@@ -150,7 +151,7 @@ State detection uses a Claude Code hook (`sw-hook.sh`) that's automatically inst
 
 Per-worktree git operations available from the TUI sidebar or fast mode menu:
 
-- **Commit** — stages tracked changes and commits with a message
+- **Commit** — stages all changes (including new files, respecting `.gitignore`; sw-managed symlinks/copies like `.venv`/`.env` are never staged) and commits with a message
 - **Push** — pushes to remote
 - **Pull** — pulls from the main branch
 - **Open PR** — creates a pull request via `gh pr create`

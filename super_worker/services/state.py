@@ -42,64 +42,106 @@ def _migrate_data(data: dict) -> dict:
     return data
 
 
-def load_state(config: ResolvedConfig) -> AppState:
-    _ensure_state_dir()
+def _resolve_state_file(config: ResolvedConfig) -> Path:
+    """Pick the state file to read: per-repo, or a matching legacy state.json."""
     state_file = _state_file_for(config)
-
-    # Try legacy state.json if per-repo file doesn't exist,
-    # but only if it belongs to this repo
     legacy_file = STATE_DIR / "state.json"
     if not state_file.exists() and legacy_file.exists():
         try:
             legacy_data = json.loads(legacy_file.read_text())
             legacy_root = legacy_data.get("repo_root") or legacy_data.get("repo_path", "")
             if str(config.repo_root) == legacy_root:
-                state_file = legacy_file
+                return legacy_file
         except (json.JSONDecodeError, OSError):
             logger.debug("Failed to read legacy state file, starting fresh")
+    return state_file
 
+
+def _read_state_unlocked(config: ResolvedConfig) -> AppState:
+    """Read + validate state (caller holds the lock). Falls back on corruption."""
+    state_file = _resolve_state_file(config)
     if not state_file.exists():
         return AppState(
             repo_root=str(config.repo_root),
             worktree_base=str(config.base_dir),
         )
-    with _file_lock(state_file, exclusive=False):
-        try:
-            data = json.loads(state_file.read_text())
-        except json.JSONDecodeError:
-            # Main file corrupted — try backup
-            bak = state_file.with_suffix(".bak")
-            if bak.exists():
-                logger.warning("State file corrupted, falling back to backup")
-                try:
-                    data = json.loads(bak.read_text())
-                except (json.JSONDecodeError, OSError):
-                    logger.warning("Backup also corrupted, starting fresh")
-                    return AppState(
-                        repo_root=str(config.repo_root),
-                        worktree_base=str(config.base_dir),
-                    )
-            else:
-                logger.warning("State file corrupted and no backup, starting fresh")
-                return AppState(
-                    repo_root=str(config.repo_root),
-                    worktree_base=str(config.base_dir),
-                )
 
-    data = _migrate_data(data)
-    return AppState.model_validate(data)
+    def _parse(path: Path) -> AppState:
+        # Raises on ANY corruption (bad JSON *or* wrong shape, e.g. `{}`).
+        return AppState.model_validate(_migrate_data(json.loads(path.read_text())))
+
+    try:
+        return _parse(state_file)
+    except Exception:
+        logger.warning("State file corrupted or invalid, falling back to backup", exc_info=True)
+    bak = state_file.with_suffix(".bak")
+    if bak.exists():
+        try:
+            return _parse(bak)
+        except Exception:
+            logger.warning("Backup also corrupted, starting fresh", exc_info=True)
+    return AppState(
+        repo_root=str(config.repo_root),
+        worktree_base=str(config.base_dir),
+    )
+
+
+def _write_state_unlocked(state: AppState, config: ResolvedConfig) -> None:
+    """Atomically write state (caller holds the lock)."""
+    state_file = _state_file_for(config)
+    if state_file.exists():
+        shutil.copy2(state_file, state_file.with_suffix(".bak"))
+    tmp = state_file.with_suffix(".tmp")
+    tmp.write_text(state.model_dump_json(indent=2))
+    tmp.rename(state_file)
+
+
+def load_state(config: ResolvedConfig) -> AppState:
+    _ensure_state_dir()
+    with _file_lock(_state_file_for(config), exclusive=False):
+        return _read_state_unlocked(config)
 
 
 def save_state(state: AppState, config: ResolvedConfig) -> None:
     _ensure_state_dir()
-    state_file = _state_file_for(config)
-    tmp = state_file.with_suffix(".tmp")
-    with _file_lock(state_file):
-        # Backup existing state file before overwriting
-        if state_file.exists():
-            shutil.copy2(state_file, state_file.with_suffix(".bak"))
-        tmp.write_text(state.model_dump_json(indent=2))
-        tmp.rename(state_file)
+    with _file_lock(_state_file_for(config)):
+        _write_state_unlocked(state, config)
+
+
+@contextmanager
+def mutate_state(config: ResolvedConfig):
+    """Load → mutate → save under ONE held exclusive lock.
+
+    Prevents lost updates when multiple `sw` processes touch the same
+    project's state (e.g. two `sw new` in parallel, or `sw add` while the
+    TUI saves): the read and the write can't interleave with another
+    writer's cycle. Yields the freshly-read AppState; mutate it in place.
+    """
+    _ensure_state_dir()
+    with _file_lock(_state_file_for(config)):
+        state = _read_state_unlocked(config)
+        yield state
+        _write_state_unlocked(state, config)
+
+
+def _conversation_exists(worktree_path: str, session_id: str) -> bool:
+    """Does Claude Code have a stored conversation with this id for this cwd?
+
+    Claude Code stores each conversation at
+    ``~/.claude/projects/<cwd-with-slashes-as-dashes>/<session_id>.jsonl``.
+    A stored session_id can point at NOTHING — e.g. a session that was created
+    (``--session-id <uuid>``) but never actually used, so Claude never wrote a
+    file. Resuming that with ``--resume <uuid>`` opens an empty conversation
+    ("wrong session"); callers should fall back to ``--continue`` instead.
+    """
+    if not session_id:
+        return False
+    try:
+        munged = str(Path(worktree_path).resolve()).replace("/", "-")
+        conv = Path.home() / ".claude" / "projects" / munged / f"{session_id}.jsonl"
+        return conv.exists()
+    except OSError:
+        return False
 
 
 def remove_worktree_from_state(state: AppState, name: str) -> AppState:
@@ -150,20 +192,65 @@ def recover_dead_sessions(state: AppState) -> bool:
 
         # Resume dead claude sessions; drop dead terminal sessions (nothing to resume)
         new_sessions = list(alive)
+        # Names already handed out this batch (alive + recreated), so a fresh
+        # recreate can't collide with a sibling — the bug that produced two
+        # sessions sharing one tmux name and resuming the wrong conversation.
+        reserved = {s.tmux_session_name for s in alive}
         for s in dead_claude:
-            # Try to respawn in-place (preserves scrollback from remain-on-exit)
-            process_cmd = build_process_cmd(
-                session_type=s.session_type,
-                skip_permissions=s.skip_permissions,
-                resume=True,
-            )
+            # Decide how to bring THIS session back — per-session, never a
+            # blanket --continue (which would give every session in the
+            # worktree the same latest conversation).
+            sid = s.claude_session_id
+            if sid and _conversation_exists(wt.path, sid):
+                mode = "resume"        # its conversation exists → --resume <id>
+            elif sid:
+                mode = "fresh_pinned"  # id but no conversation yet → --session-id <id>
+            else:
+                mode = "continue"      # legacy session with no id → best-effort --continue
+
+            if mode == "resume":
+                process_cmd = build_process_cmd(
+                    session_type=s.session_type, skip_permissions=s.skip_permissions,
+                    resume=True, session_id=sid,
+                )
+            elif mode == "fresh_pinned":
+                process_cmd = build_process_cmd(
+                    session_type=s.session_type, skip_permissions=s.skip_permissions,
+                    resume=False, session_id=sid,
+                )
+            else:
+                process_cmd = build_process_cmd(
+                    session_type=s.session_type, skip_permissions=s.skip_permissions,
+                    resume=True, session_id=None,
+                )
             resume_cmd = build_session_env_cmd(s.tmux_session_name, process_cmd)
-            if respawn_pane(s.tmux_session_name, resume_cmd):
+
+            # Only respawn in place if this dead name is unique in the batch;
+            # a duplicated name must be recreated under a fresh unique name.
+            if s.tmux_session_name not in reserved and respawn_pane(s.tmux_session_name, resume_cmd):
                 logger.info("Respawned dead pane in-place", extra={"session": s.tmux_session_name})
+                reserved.add(s.tmux_session_name)
                 new_sessions.append(s)
             else:
-                # Session gone entirely — create fresh with --continue
-                resumed = create_session(wt, label="(resumed)", skip_permissions=False, resume=True)
+                # Session gone entirely (or its name collided) — recreate it
+                # under a fresh unique name, in the same mode, preserving its
+                # conversation id and skip-permissions choice.
+                if mode == "resume":
+                    resumed = create_session(
+                        wt, label="(resumed)", skip_permissions=s.skip_permissions,
+                        resume=True, resume_session_id=sid, reserved_names=reserved,
+                    )
+                elif mode == "fresh_pinned":
+                    resumed = create_session(
+                        wt, label="(resumed)", skip_permissions=s.skip_permissions,
+                        resume=False, force_session_id=sid, reserved_names=reserved,
+                    )
+                else:
+                    resumed = create_session(
+                        wt, label="(resumed)", skip_permissions=s.skip_permissions,
+                        resume=True, resume_session_id=None, reserved_names=reserved,
+                    )
+                reserved.add(resumed.tmux_session_name)
                 new_sessions.append(resumed)
         wt.sessions = new_sessions
         changed = True
@@ -207,9 +294,40 @@ def ensure_default_worktree(state: AppState, config: ResolvedConfig) -> bool:
     return True
 
 
+def dedupe_session_names(state: AppState) -> bool:
+    """Give every session a unique tmux_session_name. Returns True if changed.
+
+    Two sessions sharing one name (a past bug) both map to the same tmux
+    session, so the preview/resume can't tell them apart. Renaming the
+    duplicate is safe: it becomes "not alive", so recovery recreates it under
+    the fresh name and resumes its OWN conversation via claude_session_id.
+    """
+    from super_worker.services.tmux import _worktree_scope, tmux_session_name
+
+    seen: set[str] = set()
+    changed = False
+    for wt in state.worktrees:
+        scope = _worktree_scope(wt)
+        for s in wt.sessions:
+            if s.tmux_session_name not in seen:
+                seen.add(s.tmux_session_name)
+                continue
+            idx = len(wt.sessions)
+            while True:
+                cand = tmux_session_name(wt.name, idx, scope)
+                if cand not in seen:
+                    break
+                idx += 1
+            logger.info("Renamed duplicate session name %s -> %s", s.tmux_session_name, cand)
+            s.tmux_session_name = cand
+            seen.add(cand)
+            changed = True
+    return changed
+
+
 def reconcile_state(state: AppState, config: ResolvedConfig | None = None) -> bool:
     """Prune worktrees whose paths no longer exist, discover new ones. Returns True if changed."""
-    changed = False
+    changed = dedupe_session_names(state)
 
     valid_worktrees = []
     for wt in state.worktrees:
@@ -247,19 +365,29 @@ def _load_registry_json() -> list[str]:
 
 
 def _normalize_registry(projects: list[str]) -> list[str]:
-    """Resolve any worktree paths to their main repo root and deduplicate."""
+    """Resolve any worktree paths to their main repo root and deduplicate.
+
+    Paths that don't exist RIGHT NOW are kept as-is: dropping them would
+    permanently forget projects on unmounted volumes / disconnected drives.
+    """
     seen: list[str] = []
     for p in projects:
         path = Path(p)
-        if not path.exists():
-            continue
-        try:
-            normalized = str(detect_repo_root(path))
-        except RuntimeError:
-            continue
-        if normalized not in seen:
-            seen.append(normalized)
+        if path.exists():
+            try:
+                p = str(detect_repo_root(path))
+            except RuntimeError:
+                continue  # exists but is no longer a git repo — drop
+        if p not in seen:
+            seen.append(p)
     return seen
+
+
+def _write_registry(registry_path: Path, projects: list[str]) -> None:
+    """Atomic write — a crash mid-write must not empty the project list."""
+    tmp = registry_path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(projects, indent=2))
+    tmp.rename(registry_path)
 
 
 def update_projects_registry(config: ResolvedConfig) -> None:
@@ -268,12 +396,12 @@ def update_projects_registry(config: ResolvedConfig) -> None:
     registry_path = STATE_DIR / "projects.json"
     with _file_lock(registry_path):
         projects = _load_registry_json()
-        # Normalize: resolve worktrees → main repo, drop missing paths.
+        # Normalize: resolve worktrees → main repo.
         projects = _normalize_registry(projects)
         repo_str = str(config.repo_root)
         if repo_str not in projects:
             projects.append(repo_str)
-        registry_path.write_text(json.dumps(projects, indent=2))
+        _write_registry(registry_path, projects)
 
 
 def remove_from_projects_registry(path: str) -> None:
@@ -282,22 +410,34 @@ def remove_from_projects_registry(path: str) -> None:
     registry_path = STATE_DIR / "projects.json"
     with _file_lock(registry_path):
         projects = [p for p in _load_registry_json() if p != path]
-        registry_path.write_text(json.dumps(projects, indent=2))
+        _write_registry(registry_path, projects)
 
 
 def load_projects_registry() -> list[str]:
     """Load list of known repo paths."""
-    return _load_registry_json()
+    registry_path = STATE_DIR / "projects.json"
+    try:
+        with _file_lock(registry_path, exclusive=False):
+            return _load_registry_json()
+    except OSError:
+        return _load_registry_json()
 
 
-def load_and_reconcile(config: ResolvedConfig) -> AppState:
+def load_and_reconcile(config: ResolvedConfig, ui_mode: str = "tui") -> AppState:
     """Load state, register project, reconcile worktrees, recover dead sessions.
 
-    Saves state if any changes were made. Used by both TUI and fast mode startup.
+    Saves state if any changes were made. Used by both TUI and fast mode
+    startup — ``ui_mode`` records which one, and matters: fast mode sets
+    ``state.ui_mode = "fast"`` and nothing ever set it back, which
+    permanently disabled TUI crash-recovery after a single fast-mode run.
     """
     state = load_state(config)
+    changed = False
+    if state.ui_mode != ui_mode:
+        state.ui_mode = ui_mode
+        changed = True
     update_projects_registry(config)
-    changed = reconcile_state(state, config)
+    changed = reconcile_state(state, config) or changed
     changed = recover_dead_sessions(state) or changed
     if changed:
         save_state(state, config)

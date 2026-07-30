@@ -514,3 +514,155 @@ class TestDiscoverWorktrees:
         result = discover_worktrees(config)
         assert len(result) == 1
         assert result[0].name == "last"
+
+
+class TestGitOpCrashSafety:
+    """Git helpers run in workers with exit_on_error=True — they must never raise."""
+
+    def test_create_pr_gh_not_installed(self, monkeypatch):
+        import subprocess
+        from super_worker.services.worktree import git_create_pr
+
+        def boom(args, **kw):
+            if args and args[0] == "gh":
+                raise FileNotFoundError("gh")
+            raise AssertionError("unexpected call")
+        monkeypatch.setattr(subprocess, "run", boom)
+
+        ok, msg = git_create_pr("/tmp", "feature", open_browser=False)
+        assert ok is False
+        assert "gh" in msg.lower()
+
+    def test_create_pr_gh_times_out(self, monkeypatch):
+        import subprocess
+        from super_worker.services.worktree import git_create_pr
+
+        def slow(args, **kw):
+            raise subprocess.TimeoutExpired(args, kw.get("timeout", 10))
+        monkeypatch.setattr(subprocess, "run", slow)
+
+        ok, msg = git_create_pr("/tmp", "feature", open_browser=False)
+        assert ok is False and "timed out" in msg.lower()
+
+    @pytest.mark.parametrize("fn_name,args", [
+        ("git_push", ("/no/such/repo", "origin", "b")),
+        ("git_pull", ("/no/such/repo", "origin", "main")),
+        ("git_commit", ("/no/such/repo", "msg")),
+    ])
+    def test_git_ops_on_missing_repo_return_error(self, fn_name, args):
+        import super_worker.services.worktree as w
+        result = getattr(w, fn_name)(*args)   # must return a string, not raise
+        assert isinstance(result, str) and result
+
+
+class TestCommitStaging:
+    """git_commit stages new files but never the sw-managed excludes."""
+
+    def _init_repo(self, tmp_path):
+        import subprocess
+        repo = tmp_path / "wt"
+        repo.mkdir()
+        env = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+               "PATH": "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"}
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True, env=env)
+        (repo / "tracked.txt").write_text("orig\n")
+        subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True, env=env)
+        subprocess.run(["git", "commit", "-qm", "init"], cwd=repo, check=True, env=env)
+        return repo, env
+
+    def test_commit_includes_new_files_excludes_secrets(self, tmp_path):
+        import subprocess
+        from super_worker.services.worktree import git_commit
+
+        repo, env = self._init_repo(tmp_path)
+        (repo / "tracked.txt").write_text("changed\n")
+        (repo / "newfile.py").write_text("print('hi')\n")  # NEW file
+        (repo / ".env").write_text("SECRET=abc\n")          # copied secret
+
+        err = git_commit(str(repo), "msg", exclude=[".env"])
+        assert err is None
+
+        committed = subprocess.run(
+            ["git", "show", "--stat", "--name-only", "--format=", "HEAD"],
+            cwd=repo, capture_output=True, text=True, env=env,
+        ).stdout.split()
+        assert "newfile.py" in committed, "new files must be committed (regression: git add -u dropped them)"
+        assert "tracked.txt" in committed
+        assert ".env" not in committed, "excluded secret must never be committed"
+        assert (repo / ".env").exists(), "excluded file must remain on disk (unstaged, not deleted)"
+
+
+class TestRemoveWorktreeAlreadyGone:
+    """A worktree deleted outside Super Worker must still be removable (tab closes)."""
+
+    def test_missing_path_does_not_raise_and_prunes(self, tmp_path, monkeypatch):
+        gone = tmp_path / "already-deleted"   # never created → doesn't exist
+        state = AppState(
+            repo_root=str(tmp_path), worktree_base=str(tmp_path),
+            worktrees=[Worktree(name="feat", path=str(gone), branch="sw-feat")],
+        )
+        mock_repo = MagicMock()
+        monkeypatch.setattr(gitpython, "Repo", lambda *a, **kw: mock_repo)
+
+        # must NOT raise even though the worktree is gone
+        remove_worktree(state, "feat", force=True)
+
+        # never tried to `git worktree remove` a nonexistent path...
+        remove_calls = [c for c in mock_repo.git.worktree.call_args_list if c.args[:1] == ("remove",)]
+        assert not remove_calls, "should skip git worktree remove when path is gone"
+        # ...but did prune stale admin state
+        mock_repo.git.worktree.assert_any_call("prune")
+
+    def test_missing_path_with_already_deleted_branch_does_not_raise(self, tmp_path, monkeypatch):
+        gone = tmp_path / "gone"
+        state = AppState(
+            repo_root=str(tmp_path), worktree_base=str(tmp_path),
+            worktrees=[Worktree(name="feat", path=str(gone), branch="sw-feat")],
+        )
+        mock_repo = MagicMock()
+        # branch already deleted locally + remotely
+        mock_repo.git.branch.side_effect = gitpython.GitCommandError("branch", 1, stderr="not found")
+        mock_repo.git.push.side_effect = gitpython.GitCommandError("push", 1, stderr="not found")
+        monkeypatch.setattr(gitpython, "Repo", lambda *a, **kw: mock_repo)
+
+        # branch deletion failures are best-effort — must not block tab removal
+        remove_worktree(state, "feat", force=True, delete_branch=True, remote="origin")
+
+    def test_present_but_unregistered_dir_not_deleted_but_no_raise(self, tmp_path, monkeypatch):
+        # dir exists but isn't a linked worktree (.git is not a gitdir file)
+        d = tmp_path / "stray"
+        d.mkdir()
+        state = AppState(
+            repo_root=str(tmp_path), worktree_base=str(tmp_path),
+            worktrees=[Worktree(name="feat", path=str(d), branch="sw-feat")],
+        )
+        mock_repo = MagicMock()
+        mock_repo.git.worktree.side_effect = _worktree_side_effect_fail_remove()
+        monkeypatch.setattr(gitpython, "Repo", lambda *a, **kw: mock_repo)
+
+        remove_worktree(state, "feat", force=True)  # must not raise
+        assert d.exists(), "must NOT delete a directory that isn't a linked worktree"
+
+
+def _worktree_side_effect_fail_remove():
+    """git.worktree: fail on 'remove', succeed on 'prune'."""
+    def _se(*args, **kw):
+        if args and args[0] == "remove":
+            raise gitpython.GitCommandError("worktree", 1, stderr="fatal: is not a working tree")
+        return ""
+    return _se
+
+
+class TestGitStatusOnMissingPath:
+    """A worktree dir deleted outside sw must not crash status queries."""
+
+    def test_branch_status_missing_path_returns_default(self):
+        from super_worker.services.worktree import get_branch_status, invalidate_git_cache
+        invalidate_git_cache("/nonexistent/gone-xyz")
+        assert get_branch_status("/nonexistent/gone-xyz", "origin", "main") == {"behind": 0, "ahead": 0}
+
+    def test_dirty_missing_path_returns_false(self):
+        from super_worker.services.worktree import get_worktree_dirty, invalidate_git_cache
+        invalidate_git_cache("/nonexistent/gone-xyz2")
+        assert get_worktree_dirty("/nonexistent/gone-xyz2") is False

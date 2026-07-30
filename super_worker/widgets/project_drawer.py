@@ -233,15 +233,15 @@ class ProjectTabBar(Widget):
             self.post_message(DockToggled(docked=False))
         elif event.button.id == "tab-open-btn":
             # Open the floating drawer as an overlay picker WITHOUT undocking.
+            # Must go through open() — adding the CSS class directly skipped
+            # _focus_list(), leaving the overlay keyboard-inert (no Escape,
+            # no Enter/Delete — closable only via Ctrl+O).
             try:
-                from super_worker.widgets.project_drawer import ProjectDrawer  # noqa: F401
-                self.app.query_one("#project-drawer").add_class("-open")  # type: ignore[union-attr]
+                self.app.query_one(ProjectDrawer).open()
             except Exception:
                 pass
-        else:
-            path = getattr(event.button, "_project_path", None)
-            if path:
-                self.post_message(ProjectSelected(path))
+        # (Project tabs are _ProjectTab containers, not Buttons — clicks on
+        # them are handled in _ProjectTab, so no fallthrough branch here.)
 
 
 # ── ProjectDrawer ─────────────────────────────────────────────────────────────
@@ -388,8 +388,18 @@ class ProjectDrawer(Widget):
         self._focus_list()
 
     def close(self) -> None:
-        """Hide the drawer."""
+        """Hide the drawer and hand focus back to the active project's terminal.
+
+        Without this, focus stays on the hidden project list — subsequent
+        keystrokes (Enter/Delete/p) keep operating on the invisible drawer.
+        """
         self.remove_class("-open")
+        try:
+            pv = getattr(self.app, "_active_project_view", None)
+            if pv is not None:
+                pv.focus_terminal()
+        except Exception:
+            pass
 
     def toggle(self) -> None:
         if self.has_class("-open"):

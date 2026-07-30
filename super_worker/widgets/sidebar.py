@@ -137,6 +137,7 @@ class SessionSidebar(Vertical):
         states: dict[str, SessionState] | None = None,
         git_status: dict | None = None,
         git_dirty: bool | None = None,
+        refresh_git: bool = True,
     ) -> None:
         is_new_worktree = self._worktree is not worktree
         self._worktree = worktree
@@ -159,7 +160,8 @@ class SessionSidebar(Vertical):
 
         if snapshot == self._prev_session_snapshot and not is_new_worktree:
             # No change in sessions - skip list rebuild entirely
-            self._refresh_git_status(worktree, status=git_status, dirty=git_dirty)
+            if refresh_git:
+                self._refresh_git_status(worktree, status=git_status, dirty=git_dirty)
             return
 
         self._prev_session_snapshot = snapshot
@@ -197,7 +199,8 @@ class SessionSidebar(Vertical):
         if prev_index is not None and prev_index < new_count:
             sess_list.index = prev_index
 
-        self._refresh_git_status(worktree, status=git_status, dirty=git_dirty)
+        if refresh_git:
+            self._refresh_git_status(worktree, status=git_status, dirty=git_dirty)
 
     def _refresh_git_status(self, worktree: Worktree, status: dict | None = None, dirty: bool | None = None) -> None:
         if status is None:

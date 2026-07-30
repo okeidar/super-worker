@@ -328,7 +328,7 @@ class TestPeriodicRefreshLightweight:
     def test_periodic_refresh_imports_batch_check_alive(self):
         """ProjectView should import batch_check_alive for periodic_refresh."""
         import super_worker.widgets.project_view as pv_mod
-        source = inspect.getsource(pv_mod.ProjectView.periodic_refresh)
+        source = inspect.getsource(pv_mod.ProjectView._periodic_refresh_impl)
         assert "batch_check_alive" in source
         # Should NOT use batch_detect_session_states (heavyweight)
         assert "batch_detect_session_states" not in source
@@ -336,7 +336,7 @@ class TestPeriodicRefreshLightweight:
     def test_periodic_refresh_reads_state_files(self):
         """periodic_refresh should use read_all_state_files for state."""
         import super_worker.widgets.project_view as pv_mod
-        source = inspect.getsource(pv_mod.ProjectView.periodic_refresh)
+        source = inspect.getsource(pv_mod.ProjectView._periodic_refresh_impl)
         assert "read_all_state_files" in source
 
 
