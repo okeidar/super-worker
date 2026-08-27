@@ -2,7 +2,7 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
 from textual.message import Message
-from textual.widgets import Button, Label, ListItem, ListView, Static
+from textual.widgets import Label, ListItem, ListView, Static
 
 from super_worker.constants import get_session_type_tag
 from super_worker.models import Session, Worktree
@@ -43,9 +43,8 @@ class SessionSidebar(Vertical):
     DEFAULT_CSS = """
     SessionSidebar {
         width: 32;
-        min-width: 26;
+        min-width: 16;
         height: 1fr;
-        border-right: solid $accent;
         background: $surface;
         padding: 0;
     }
@@ -71,15 +70,6 @@ class SessionSidebar(Vertical):
         height: auto;
         padding: 0 1;
         color: $text-muted;
-    }
-    #git-actions {
-        height: auto;
-        padding: 0 1;
-    }
-    #git-actions Button {
-        width: 100%;
-        min-width: 12;
-        margin: 0 0 0 0;
     }
     #sidebar-hint {
         height: auto;
@@ -108,16 +98,7 @@ class SessionSidebar(Vertical):
         yield ListView(id="session-list")
         yield Static("Git", classes="sidebar-section")
         yield Static("", id="git-status")
-        with Vertical(id="git-actions"):
-            yield Button("Commit", id="btn-git-commit", variant="default")
-            yield Button("Push", id="btn-git-push", variant="default")
-            yield Button("Pull", id="btn-git-pull", variant="default")
-            yield Button("Open PR", id="btn-git-pr", variant="primary")
         yield Static("x: delete session", id="sidebar-hint")
-
-    def on_mount(self) -> None:
-        for btn in self.query("#git-actions Button"):
-            btn.can_focus = False
 
     @staticmethod
     def _state_dot(state: SessionState) -> str:
@@ -241,19 +222,6 @@ class SessionSidebar(Vertical):
         if idx is not None and idx in self._session_map and self._worktree:
             self.post_message(SessionSelected(self._worktree, self._session_map[idx]))
 
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if not self._worktree:
-            return
-        btn_id = event.button.id
-        if btn_id == "btn-git-commit":
-            self.post_message(GitAction(self._worktree, "commit"))
-        elif btn_id == "btn-git-push":
-            self.post_message(GitAction(self._worktree, "push"))
-        elif btn_id == "btn-git-pull":
-            self.post_message(GitAction(self._worktree, "pull"))
-        elif btn_id == "btn-git-pr":
-            self.post_message(GitAction(self._worktree, "pr"))
-
     def action_delete_session(self) -> None:
         if not self._worktree:
             return
@@ -263,3 +231,91 @@ class SessionSidebar(Vertical):
         if idx is not None and idx in self._session_map:
             session = self._session_map[idx]
             self.post_message(SessionDeleted(self._worktree, session))
+
+
+class SidebarDivider(Static):
+    """Thin vertical bar between the session sidebar and the terminal pane.
+
+    Drag it left/right to resize the sidebar. The chosen width is a class-level
+    value so every worktree tab (across all projects) stays in sync for the rest
+    of the session. Nothing is persisted to disk — reopening the app restores the
+    default width.
+    """
+
+    DEFAULT_CSS = """
+    SidebarDivider {
+        width: 1;
+        height: 1fr;
+        background: $panel;
+        color: $accent;
+        content-align: center middle;
+    }
+    SidebarDivider:hover, SidebarDivider.-dragging {
+        background: $accent;
+    }
+    """
+
+    MIN_WIDTH = 16          # never shrink the sidebar below this
+    _MIN_TERMINAL = 24      # always leave at least this many columns for the terminal
+    _shared_width: int | None = None  # persists across tabs for the session
+
+    def __init__(self) -> None:
+        super().__init__("┊")
+        self._dragging = False
+
+    def on_mount(self) -> None:
+        if SidebarDivider._shared_width is not None:
+            self._set_sidebar_width(SidebarDivider._shared_width)
+
+    def _sidebar(self) -> SessionSidebar | None:
+        parent = self.parent
+        if parent is None:
+            return None
+        try:
+            return parent.query_one(SessionSidebar)
+        except Exception:
+            return None
+
+    def _clamp(self, width: int) -> int:
+        parent = self.parent
+        avail = parent.region.width if parent is not None else 0
+        upper = max(self.MIN_WIDTH, avail - self._MIN_TERMINAL)
+        return max(self.MIN_WIDTH, min(width, upper))
+
+    def _set_sidebar_width(self, width: int) -> None:
+        sidebar = self._sidebar()
+        if sidebar is not None:
+            sidebar.styles.width = width
+
+    def on_mouse_down(self, event) -> None:
+        self._dragging = True
+        self.add_class("-dragging")
+        self.capture_mouse()
+        event.stop()
+
+    def on_mouse_move(self, event) -> None:
+        if not self._dragging:
+            return
+        parent = self.parent
+        if parent is None:
+            return
+        width = self._clamp(int(event.screen_x) - parent.region.x)
+        self._set_sidebar_width(width)          # live feedback on this tab
+        SidebarDivider._shared_width = width
+        event.stop()
+
+    def on_mouse_up(self, event) -> None:
+        if not self._dragging:
+            return
+        self._dragging = False
+        self.remove_class("-dragging")
+        self.release_mouse()
+        # Propagate the final width to every other tab's sidebar so they match.
+        width = SidebarDivider._shared_width
+        if width is not None:
+            try:
+                for sidebar in self.app.query(SessionSidebar):
+                    sidebar.styles.width = width
+            except Exception:
+                pass
+        event.stop()

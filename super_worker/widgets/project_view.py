@@ -57,7 +57,13 @@ from super_worker.services.worktree import (
     invalidate_git_cache,
     remove_worktree,
 )
-from super_worker.widgets.sidebar import GitAction, SessionDeleted, SessionSelected, SessionSidebar
+from super_worker.widgets.sidebar import (
+    GitAction,
+    SessionDeleted,
+    SessionSelected,
+    SessionSidebar,
+    SidebarDivider,
+)
 from super_worker.widgets.terminal_pane import TerminalPane
 
 logger = logging.getLogger(__name__)
@@ -96,6 +102,7 @@ class WorktreeTabContent(Horizontal):
 
     def compose(self) -> ComposeResult:
         yield SessionSidebar(remote=self._remote, main_branch=self._main_branch)
+        yield SidebarDivider()
         yield TerminalPane()
 
     def on_mount(self) -> None:
