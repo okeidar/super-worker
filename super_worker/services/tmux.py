@@ -242,6 +242,19 @@ def _find_available_session_name(worktree: Worktree, reserved: set[str] | None =
 
 
 
+def _default_session_label(sess_name: str) -> str:
+    """Default label derived from the session's unique tmux index.
+
+    ``len(worktree.sessions)`` is NOT unique — deleting then adding a session
+    repeats the count and yields duplicate labels (two "session 1"), which are
+    indistinguishable in the sidebar. The tmux name's trailing index is already
+    allocated to be unique per worktree (see ``_find_available_session_name``),
+    so reuse it for a stable, collision-free label.
+    """
+    tail = sess_name.rsplit("-", 1)[-1]
+    return f"session {tail}" if tail.isdigit() else "session"
+
+
 def build_process_cmd(
     session_type: str = "claude",
     skip_permissions: bool = False,
@@ -317,7 +330,7 @@ def create_session(
         session_label = label or "terminal"
         session_id = None
     else:
-        session_label = label or prompt or f"session {len(worktree.sessions)}"
+        session_label = label or prompt or _default_session_label(sess_name)
         if resume:
             session_id = resume_session_id
         else:

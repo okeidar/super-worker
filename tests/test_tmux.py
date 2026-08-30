@@ -27,6 +27,24 @@ def test_tmux_session_name(name, index, expected):
     assert tmux_session_name(name, index) == expected
 
 
+def test_default_session_label_uses_unique_index():
+    """Default labels derive from the session's unique tmux index, not a count.
+
+    Regression: the old ``f"session {len(worktree.sessions)}"`` repeated after a
+    delete, producing two indistinguishable "session 1"s.
+    """
+    from super_worker.services.tmux import _default_session_label
+
+    assert _default_session_label("sw-main-7350d8-1") == "session 1"
+    assert _default_session_label("sw-main-7350d8-2") == "session 2"
+    # Worktree names may contain hyphens — only the trailing index matters.
+    assert _default_session_label("sw-aii-229-be7ab0-0") == "session 0"
+    # Distinct names never collide on the label.
+    assert _default_session_label("sw-x-1") != _default_session_label("sw-x-2")
+    # Non-numeric tail falls back gracefully rather than crashing.
+    assert _default_session_label("sw-weird") == "session"
+
+
 def _mock_server(monkeypatch, session=None, pane=None):
     """Build a mock libtmux server with optional session and pane."""
     mock_pane = pane or MagicMock()

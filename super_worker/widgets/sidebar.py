@@ -1,3 +1,5 @@
+from collections import Counter
+
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
@@ -153,12 +155,20 @@ class SessionSidebar(Vertical):
         current_count = len(sess_list.children)
         new_count = len(worktree.sessions)
 
+        # Sessions that share a label would render as identical rows — append
+        # the unique tmux index so two "session 1"s are still tellable apart.
+        label_counts = Counter(s.label for s in worktree.sessions)
+
         # Update existing items in-place, add/remove only as needed
         for i, s in enumerate(worktree.sessions):
             state = states.get(s.tmux_session_name, SessionState.RUNNING)
             dot = self._state_dot(state)
             tag = f"[dim]{get_session_type_tag(s.session_type)}[/]"
-            label_text = f"{dot} {tag} {s.label}"
+            disp_label = s.label
+            if label_counts[s.label] > 1:
+                idx = s.tmux_session_name.rsplit("-", 1)[-1]
+                disp_label = f"{s.label} [dim]#{idx}[/]"
+            label_text = f"{dot} {tag} {disp_label}"
             self._session_map[i] = s
 
             if i < current_count:

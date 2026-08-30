@@ -1,8 +1,9 @@
 """Tests for SessionSidebar.show_worktree() using Textual's run_test pattern."""
 
 import pytest
+from rich.text import Text
 from textual.app import App, ComposeResult
-from textual.widgets import ListView
+from textual.widgets import Label, ListView
 
 from super_worker.models import Session, Worktree
 from super_worker.services.tmux import SessionState
@@ -119,3 +120,51 @@ async def test_session_map_tracks_sessions():
         assert len(sidebar._session_map) == 3
         for i, session in enumerate(wt.sessions):
             assert sidebar._session_map[i] is session
+
+
+def _rendered_labels(sidebar) -> list[str]:
+    out = []
+    for lbl in sidebar.query_one("#session-list", ListView).query(Label):
+        r = lbl.render()
+        # Textual may return a Content/Text (has .plain) or a raw markup str.
+        out.append(r.plain if hasattr(r, "plain") else Text.from_markup(str(r)).plain)
+    return out
+
+
+@pytest.mark.asyncio
+async def test_duplicate_labels_are_disambiguated():
+    """Two sessions sharing a label get a distinguishing #index suffix.
+
+    Regression: default labels came from ``len(worktree.sessions)``, which
+    repeats after a delete, so two sessions could both read "session 1" and
+    look like the same session in the sidebar.
+    """
+    sessions = [
+        Session(tmux_session_name="sw-main-aa11-1", label="session 1"),
+        Session(tmux_session_name="sw-main-aa11-2", label="session 1"),
+    ]
+    wt = Worktree(name="main", path="/tmp/test", branch="main", sessions=sessions)
+    app = SidebarTestApp()
+    async with app.run_test() as pilot:
+        sidebar = app.query_one(SessionSidebar)
+        sidebar.show_worktree(wt, states=_states(wt), git_status=_GIT, git_dirty=False)
+        await pilot.pause()
+
+        labels = _rendered_labels(sidebar)
+        assert len(labels) == 2
+        assert labels[0] != labels[1], "duplicate-labeled rows must be distinguishable"
+        assert "#1" in labels[0] and "#2" in labels[1]
+
+
+@pytest.mark.asyncio
+async def test_unique_labels_get_no_suffix():
+    """Distinct labels are shown as-is, without the disambiguation suffix."""
+    wt = _make_worktree(["alpha", "beta"])
+    app = SidebarTestApp()
+    async with app.run_test() as pilot:
+        sidebar = app.query_one(SessionSidebar)
+        sidebar.show_worktree(wt, states=_states(wt), git_status=_GIT, git_dirty=False)
+        await pilot.pause()
+
+        labels = _rendered_labels(sidebar)
+        assert all("#" not in text for text in labels)
